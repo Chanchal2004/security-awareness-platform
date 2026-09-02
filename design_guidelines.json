@@ -1,0 +1,142 @@
+{
+  "project_title": "TALBROS SECURITY AWARENESS CENTER",
+  "project_subtitle": "Employee Phishing Awareness & Security Simulation Platform",
+  "archetype": "THE PERFORMANCE PRO / TACTICAL ENTERPRISE SECURITY",
+  "theme_strategy": {
+    "default_mode": "dark",
+    "toggle_supported": true,
+    "dark_theme": {
+      "background": "#0B0F17",
+      "surface_card": "#111827",
+      "surface_elevated": "#1F2937",
+      "border": "#1F2D40",
+      "border_highlight": "#374151",
+      "text_primary": "#F9FAFB",
+      "text_secondary": "#9CA3AF",
+      "text_muted": "#6B7280",
+      "accent_primary": "#6366F1",
+      "accent_secondary": "#06B6D4",
+      "accent_amber_warning": "#F59E0B",
+      "accent_emerald_safe": "#10B981",
+      "accent_rose_danger": "#F43F5E"
+    },
+    "light_theme": {
+      "background": "#F8FAFC",
+      "surface_card": "#FFFFFF",
+      "surface_elevated": "#F1F5F9",
+      "border": "#E2E8F0",
+      "border_highlight": "#CBD5E1",
+      "text_primary": "#0F172A",
+      "text_secondary": "#475569",
+      "text_muted": "#94A3B8",
+      "accent_primary": "#4F46E5",
+      "accent_secondary": "#0891B2",
+      "accent_amber_warning": "#D97706",
+      "accent_emerald_safe": "#059669",
+      "accent_rose_danger": "#E11D48"
+    }
+  },
+  "typography": {
+    "heading_font": "Outfit, sans-serif",
+    "body_font": "Manrope, sans-serif",
+    "mono_font": "JetBrains Mono, monospace",
+    "hierarchy": {
+      "h1_dashboard": "text-2xl sm:text-3xl font-bold tracking-tight",
+      "h2_section": "text-xl sm:text-2xl font-semibold tracking-tight",
+      "h3_card_title": "text-base sm:text-lg font-semibold tracking-tight",
+      "h4_label": "text-xs font-semibold uppercase tracking-wider text-muted-foreground",
+      "metric_hero": "text-3xl sm:text-4xl font-extrabold tracking-tight font-mono",
+      "body": "text-sm font-normal leading-relaxed"
+    }
+  },
+  "layout_and_navigation": {
+    "structure": "Sidebar + Fixed Header + Fluid Main Content Area",
+    "sidebar": {
+      "width": "w-64",
+      "style": "bg-slate-950/80 backdrop-blur-md border-r border-slate-800/80 flex flex-col justify-between p-4",
+      "brand_header": "TALBROS Security Awareness Center with Shield Icon and Live Status Indicator",
+      "items": [
+        {"id": "dashboard", "label": "Dashboard", "icon": "LayoutDashboard", "path": "/"},
+        {"id": "create-simulation", "label": "Create Simulation", "icon": "Send", "path": "/create-simulation"},
+        {"id": "simulation-history", "label": "Simulation History", "icon": "History", "path": "/history"},
+        {"id": "recipients", "label": "Recipients", "icon": "Users", "path": "/recipients"},
+        {"id": "departments", "label": "Departments", "icon": "Building2", "path": "/departments"},
+        {"id": "landing-pages", "label": "Landing Pages", "icon": "FileCode", "path": "/landing-pages"},
+        {"id": "awareness-forms", "label": "Awareness Forms", "icon": "FileCheck2", "path": "/awareness-forms"},
+        {"id": "reports", "label": "Reports", "icon": "BarChart3", "path": "/reports"},
+        {"id": "email-senders", "label": "Email Senders", "icon": "Mail", "path": "/email-senders"},
+        {"id": "sandbox", "label": "Test / Sandbox", "icon": "TestTube2", "path": "/sandbox"},
+        {"id": "audit-logs", "label": "Audit Logs", "icon": "ShieldAlert", "path": "/audit-logs"},
+        {"id": "settings", "label": "Settings", "icon": "Settings", "path": "/settings"}
+      ]
+    },
+    "header": {
+      "style": "h-16 border-b border-border bg-background/80 backdrop-blur-md px-6 flex items-center justify-between sticky top-0 z-40",
+      "elements": [
+        "Global Search Bar (Command/Ctrl + K trigger)",
+        "Environment Badge (Live Production / Sandbox)",
+        "Notification Bell with pulse counter",
+        "Dark/Light Mode Toggle Switch",
+        "Admin User Profile Dropdown with Role Badge (Security Ops Lead)"
+      ]
+    }
+  },
+  "dashboard_grid_rules": {
+    "bento_mode": "High Density Dashboard Grid",
+    "gap": "gap-4 sm:gap-6",
+    "kpi_metrics_row": "grid grid-cols-2 md:grid-cols-4 lg:grid-cols-7 gap-4",
+    "charts_section": "grid grid-cols-1 lg:grid-cols-12 gap-6",
+    "cards_distribution": {
+      "metric_cards": "col-span-1 each for Total Simulations, Total Recipients, Sent/Delivered, Observed Opens, Link Clicks, Page Visits, Submissions",
+      "main_timeline_chart": "col-span-full lg:col-span-8 (Simulation Activity & Engagement Over Time)",
+      "department_risk_chart": "col-span-full lg:col-span-4 (Department Vulnerability & Click Rate)",
+      "recent_activity_feed": "col-span-full lg:col-span-6 (Live Activity Feed: Opens, Clicks, Form Submits)",
+      "recent_simulations_table": "col-span-full lg:col-span-6 (Active & Completed Phishing Campaigns)"
+    }
+  },
+  "component_design_specs": {
+    "cards": "Border-driven 1px solid border (border-border/60) with subtle dark slate background (bg-card), sharp/minimal radius (rounded-lg), no heavy drop shadows",
+    "status_badges": {
+      "active": "bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-mono text-xs px-2.5 py-0.5 rounded-full",
+      "high_risk": "bg-rose-500/10 text-rose-400 border border-rose-500/20 font-mono text-xs px-2.5 py-0.5 rounded-full",
+      "medium_risk": "bg-amber-500/10 text-amber-400 border border-amber-500/20 font-mono text-xs px-2.5 py-0.5 rounded-full",
+      "draft": "bg-slate-500/10 text-slate-400 border border-slate-500/20 font-mono text-xs px-2.5 py-0.5 rounded-full"
+    },
+    "tables": "Dense administrative layout, sticky headers, subtle row hover state (hover:bg-muted/40), pagination, sorting, status filters, selection checkboxes",
+    "charts": "Recharts responsive containers using semi-transparent gradients under line curves, dark tooltip cards, precise custom color palettes",
+    "rich_email_editor": "Interactive simulation composer with variable tags, template gallery, live device toggle preview (Desktop / Mobile)",
+    "forms": "Structured step-by-step wizard for simulation creation: 1. Target Audience, 2. Sender Identity, 3. Email Template & Trigger, 4. Landing/Awareness Page, 5. Schedule & Launch"
+  },
+  "image_urls": [
+    {
+      "category": "soc_hero_background",
+      "url": "https://images.unsplash.com/photo-1708807472445-d33589e6b090?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHw0fHxjeWJlcnNlY3VyaXR5JTIwc2VjdXJpdHklMjBvcGVyYXRpb24lMjBjZW50ZXIlMjB0ZWNobm9sb2d5fGVufDB8fHx8MTc4ODI1MzkxN3ww&ixlib=rb-4.1.0&q=85",
+      "description": "Security Operation Center with monitors displaying data streams"
+    },
+    {
+      "category": "cybersecurity_laptop",
+      "url": "https://images.unsplash.com/photo-1589186161289-9eb8898086df?crop=entropy&cs=srgb&fm=jpg&ixid=M3w4NjAzNDR8MHwxfHNlYXJjaHwyfHxjeWJlcnNlY3VyaXR5JTIwc2VjdXJpdHklMjBvcGVyYXRpb24lMjBjZW50ZXIlMjB0ZWNobm9sb2d5fGVufDB8fHx8MTc4ODI1MzkxN3ww&ixlib=rb-4.1.0&q=85",
+      "description": "Cybersecurity terminal interface"
+    }
+  ],
+  "testing_and_accessibility": {
+    "data_testid_rule": "ALL interactive components, buttons, inputs, navigation links, filters, table rows, tab switches, modal triggers, and key metric numbers MUST include explicit kebab-case data-testid attributes.",
+    "examples": [
+      "data-testid='sidebar-link-dashboard'",
+      "data-testid='create-simulation-button'",
+      "data-testid='metric-total-simulations'",
+      "data-testid='search-input-recipients'",
+      "data-testid='csv-export-button'",
+      "data-testid='launch-simulation-submit'",
+      "data-testid='theme-toggle-button'"
+    ]
+  },
+  "UNIVERSAL GUIDELINES FOR MAIN AGENT": [
+    "Ensure dark theme looks like a crisp SOC enterprise console with subtle 1px border lines, dark indigo/cyan accents, and high-visibility status tags.",
+    "Do NOT use forbidden teal color #1B93A4 or forbidden font Space Grotesk.",
+    "Make sure every view has realistic sample data (e.g. realistic phishing templates like Executive HR Salary Review, IT Password Reset, Urgent Cloud Storage Access, Office 365 Re-authentication).",
+    "Provide interactive features in Sandbox/Test mode so authorized admins can simulate live clicks, opens, and form entries to test analytics updates in real-time.",
+    "Use Lucide-react or Radix UI icons consistently.",
+    "Always attach data-testid attributes to all interactive elements."
+  ]
+}

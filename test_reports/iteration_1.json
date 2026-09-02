@@ -1,0 +1,57 @@
+{
+  "summary": "Full backend + frontend verification of TALBROS Security Awareness Center. PRIMARY LOGIN BUG IS FIXED: admin logs in via UI at /login with jbenterpriises01@gmail.com / Talbros@2026, lands on the dashboard, session persists on refresh (httpOnly cookies), wrong password shows 'Invalid email or password' without logging in, logout redirects to /login and protected routes redirect when unauthenticated. Backend pytest suite (38 tests across auth, recipients/departments/senders/landing/forms, simulations, sandbox tracking, public tracking, analytics, reports, audit, guardrails) passes 100%. UI verified end-to-end: recipients single/bulk/CSV import (1 valid / 1 dup / 1 invalid preview then confirm), search + dept filter, enable toggle + delete, departments create/search/rename/delete, create-simulation (mode defaults to Sandbox, simulated sender identity renders in preview, landing/form selects, Save Draft), sandbox send + Simulate Pipeline + individual event firing with counters updating, recipient Timeline modal in chronological order, unique 32-char tokens per recipient, public /lp/{token} recording LANDING_PAGE_VISITED + FORM_STARTED + FORM_SUBMITTED, dashboard metrics/rates/charts, all 4 CSV report exports downloading, audit logs with LOGIN/SIMULATION_CREATED/RECIPIENT_CREATED filters. Two real frontend defects found: rich-text email body editor reverses typed characters, and no mobile navigation.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "/api/analytics/dashboard", "issue": "'Activity Over Time' chart counts raw events (e.g. opens 13) while metric cards count unique recipients (opens 9) - same labels, different meaning, looks like inconsistent data to a user"},
+      {"endpoint": "/api/analytics/dashboard", "issue": "Loads up to 50,000 simulation_events into Python memory to build the daily activity series instead of using a MongoDB aggregation pipeline - will not scale"}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [
+      {"component": "RichEditor (Create Simulation → Email Body)", "issue": "Typed characters are inserted in reverse order. Typing 'Hello Team' renders '<p>maeT olleH</p>'. Cause: the contentEditable div is rendered with dangerouslySetInnerHTML bound to the controlled `value`, so every onInput→setState re-render replaces the DOM children and resets the caret to offset 0. Email body composition (a core flow) is effectively unusable for manual typing; only template buttons produce correct bodies.", "selector": "[data-testid=\"sim-body-editor\"]", "priority": "HIGH"},
+      {"component": "Layout (mobile)", "issue": "Sidebar is `hidden md:flex` and there is no hamburger/drawer, so on viewports < 768px there is NO navigation at all - user can only see the current page. Global search is also hidden on mobile.", "selector": "aside.hidden.md\\:flex", "priority": "HIGH"}
+    ],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "App-wide forms", "issues": ["All dropdowns are native <select> elements (sim-sender-select, sim-mode-select, sim-landing-select, sim-form-select, dept-filter, status-filter, audit-action-filter, report-sim-select) instead of the shadcn Select used elsewhere - inconsistent with the dark theme and renders the OS picker", "Schedule field uses native <input type=\"datetime-local\"> browser picker instead of the shadcn calendar/date-time component"]},
+      {"screen": "Recipients / Departments", "issues": ["Destructive delete uses native window.confirm() instead of the shadcn AlertDialog used elsewhere in the app"]},
+      {"screen": "Simulation History", "issues": ["Rows are hover-highlighted like they are clickable but only the small SIM-ID link navigates to the detail page - clicking anywhere else does nothing"]},
+      {"screen": "Console (all authenticated pages)", "issues": ["React hydration warning spam: '<span> cannot be a child of <option>' - caused by the dynamic-instrumentation spans inside <option> children in CreateSimulation/Sandbox/Reports selects"]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_auth.py",
+    "/app/backend/tests/test_resources.py",
+    "/app/backend/tests/test_simulations.py",
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/cleanup_ui_test_data.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "FIX (HIGH): RichEditor - stop re-rendering the contentEditable from state on every keystroke. Set initial HTML once (useEffect/ref, or only when the incoming value differs from ref.current.innerHTML) so the caret is preserved; verify typing 'Hello Team' yields 'Hello Team'.",
+    "FIX (HIGH): Add a mobile nav (hamburger + Sheet/drawer) for the sidebar below md, and expose the global search on mobile.",
+    "POLISH: Replace native <select>/datetime-local/window.confirm with the shadcn Select, date-time picker and AlertDialog for theme consistency.",
+    "POLISH: Make the whole Simulation History row navigate to the detail page (or drop the hover affordance).",
+    "CONSIDER: Label the dashboard activity chart series as event counts (or aggregate unique recipients) so it matches the metric cards; convert the activity build-up to a Mongo aggregation.",
+    "CONSIDER: startup() unconditionally rewrites the admin password hash from ADMIN_PASSWORD on every boot - fine for this preview, but any password changed through the app would be silently reverted on restart. Also @app.on_event('startup') is deprecated; prefer a lifespan handler."
+  ],
+  "critical_code_review_comments": [
+    "CreateSimulation.ensureCreated() caches createdId: after 'Save Draft', any further edits (recipients/subject/body/tracking) are NOT persisted - clicking 'Send Now' or 'Send Test' sends the stale draft. Either PUT the updated payload or reset createdId when the form changes.",
+    "RichEditor uses document.execCommand (deprecated) plus dangerouslySetInnerHTML on a controlled contentEditable - root cause of the reversed-typing bug.",
+    "/api/analytics/dashboard fetches 50k events client-side in Python; move to an aggregation pipeline.",
+    "server.py is 1207 lines - split into routers (auth, recipients, simulations, tracking, analytics/reports) per the 700-line guideline.",
+    "Playbook checks all pass: bcrypt hashes are $2b$, login sets httpOnly+secure+samesite=none access/refresh cookies, CORS uses explicit origin from CORS_ORIGINS with allow_credentials=True, 5-failure lockout returns 429, seed updates the existing admin's hash. Note allow_origins falls back to '*' if CORS_ORIGINS is unset, which is invalid with credentials - consider failing fast instead."
+  ],
+  "updated_files": [
+    "/app/frontend/src/pages/Departments.jsx (added missing data-testids: search-input-departments, dept-edit-btn-<name>, dept-delete-btn-<name>, dept-rename-input-<name>)",
+    "/app/backend/tests/cleanup_ui_test_data.py (new helper to delete UI-test recipients)"
+  ],
+  "success_rate": {"backend": "100% (38/38 pytest)", "frontend": "~90% (all flows pass except rich-text editor typing and mobile navigation)"},
+  "seed_data_creation": "Created and then deleted: TEST_Dept_1788256139 (renamed to TEST_Dept_Renamed then deleted), recipients test_qa1/2/3_1788256139@example.com and test_csv_*@example.com (all deleted). Left in place: sandbox simulation SIM-2026-000015 (subject 'TEST_UI Awareness 1788256197') with 2 recipients and a full event trail, plus TEST_ simulations created by the pytest suite.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "/app/memory/test_credentials.md present and valid - jbenterpriises01@gmail.com / Talbros@2026 works via API and UI",
+  "context_for_next_testing_agent": "Backend regression suite lives in /app/backend/tests (conftest.py + test_auth.py + test_resources.py + test_simulations.py); run `cd /app/backend && python -m pytest tests/ -v --junitxml=/app/test_reports/pytest/pytest_results.xml` (11s, 38 tests). Login bug is fixed - do not re-open. Routes: /login, / (dashboard), /create-simulation, /history, /history/{id}, /recipients, /departments, /sandbox, /reports, /audit-logs, /lp/{token}. Simulation detail is reached only by clicking the SIM-ID link in history. Sandbox simulate-full is probabilistic, so landing/form counters may stay 0 for some recipients - fire individual events (fire-<EVENT>-<email>) for deterministic checks. After a fix, re-verify: type into [data-testid=\"sim-body-editor\"] and assert the text is NOT reversed, and check mobile (390x844) navigation exists.",
+  "rca_of_the_issue": "Login: verified fixed - startup() now rehashes ADMIN_PASSWORD with bcrypt into the existing admin doc and clears db.login_attempts, so credentials are deterministic and no stale lockout blocks sign-in; UI login, /auth/me on refresh, logout and 5-attempt lockout all behave correctly. New HIGH bug (RichEditor): the contentEditable body editor is rendered via dangerouslySetInnerHTML from the controlled React state, so each keystroke's setState replaces the node's children and the caret jumps to position 0, producing reversed text (typed 'Hello Team' -> '<p>maeT olleH</p>'). Reproduce: /create-simulation -> click the email body -> type any word. Mitigation: write the HTML into the node only when it differs from the live innerHTML (or make the editor uncontrolled with an initial value)."
+}

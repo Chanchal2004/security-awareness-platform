@@ -1,0 +1,47 @@
+{
+  "summary": "Re-test (iteration 2) of TALBROS Security Awareness Center focused on the 3 reported fixes + regression. ALL THREE FIXES VERIFIED WORKING. FIX1 RichEditor: typing 'Hello Team Members' into [data-testid=sim-body-editor] renders in the CORRECT order (no reversal); clicking the 'IT Password Reset' template replaces body+subject correctly and typing after the template insert also stays in order (appended ' Verify Now Please' correctly at caret). FIX2 Mobile nav (390x844): [data-testid=mobile-menu-button] visible, opens [data-testid=mobile-nav-drawer] with all 12 sidebar links, clicking sidebar-link-recipients navigates to /recipients AND closes the drawer; global-search-input is visible on mobile. FIX3 Stale draft: created draft with 1 recipient + subject 'TEST_Draft_Orig', clicked Save Draft, then edited the subject to 'TEST_Draft_EDITED' and added a 2nd recipient, clicked Send Now (Sandbox) -> detail SIM-2026-000030 shows the EDITED subject (original absent) and BOTH recipients; PUT /api/simulations/{sid} is used correctly. Regression: admin login works and lands on dashboard; Simulate Pipeline on the sandbox sim recorded events (Sent 2, Delivered 2, Opens 2, Clicks 2, status COMPLETED) and dashboard renders metrics. Backend pytest: 43/43 passed (38 existing + 5 new tests for PUT /api/simulations/{sid}).",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "PUT /api/simulations/{sid}", "issue": "Recipient rows are deleted and re-inserted on every update, so tracking tokens are regenerated for unchanged recipients. Harmless for DRAFT (nothing sent yet) but any previously shared/pre-generated token becomes invalid."},
+      {"endpoint": "/api/analytics/dashboard", "issue": "Carried over from iteration_1 (not re-fixed): activity chart counts raw events while metric cards count unique recipients; and up to 50k events are loaded into Python instead of a Mongo aggregation."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [
+      {"screen": "Mobile nav drawer (Layout)", "issues": ["Console error: 'DialogContent requires a DialogTitle for the component to be accessible for screen reader users' - add a VisuallyHidden SheetTitle to [data-testid=mobile-nav-drawer]"]},
+      {"screen": "Console (Create Simulation / Sandbox / Reports)", "issues": ["Pre-existing React warning spam: '<span> cannot be a child of <option>' from instrumentation spans inside <option> children"]},
+      {"screen": "App-wide forms (carried over)", "issues": ["Native <select>, native datetime-local picker and window.confirm still used instead of shadcn Select / date-time picker / AlertDialog"]}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_simulation_update.py",
+    "/app/backend/tests/test_auth.py",
+    "/app/backend/tests/test_resources.py",
+    "/app/backend/tests/test_simulations.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "OPTIONAL a11y: add a hidden SheetTitle/DialogTitle inside the mobile nav drawer to silence the Radix accessibility error.",
+    "OPTIONAL: preserve existing recipient tokens in PUT /api/simulations/{sid} instead of delete_many + re-insert.",
+    "Remaining polish items from iteration_1 (shadcn Select/date picker/AlertDialog, <span>-in-<option> warning, dashboard aggregation) are still open but non-blocking."
+  ],
+  "critical_code_review_comments": [
+    "RichEditor fix is correct: innerHTML is written only when the incoming value differs from the live DOM, so the caret is preserved. document.execCommand is still deprecated but functional for bold/italic/link.",
+    "CreateSimulation.ensureCreated() now PUTs when createdId exists - stale-draft bug resolved. Note: after Send Now the sim leaves DRAFT, so a second Send Now click on the same page would 400 from the PUT ('Only draft or scheduled simulations can be edited'); the code navigates away immediately, so it is only a theoretical edge case.",
+    "server.py remains >1200 lines - still worth splitting into routers."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_simulation_update.py (new: 5 tests for PUT /api/simulations/{sid})",
+    "/app/backend/tests/cleanup_ui_test_data.py (also removes test_put* recipients)"
+  ],
+  "success_rate": {"backend": "100% (43/43 pytest)", "frontend": "100% of targeted fixes + regression flows passed"},
+  "seed_data_creation": "Created and deleted recipients test_qa_a/b_* and test_put1..5_*. Simulations created by pytest were deleted by fixtures; the UI-created sandbox sim SIM-2026-000030 (subject 'TEST_Draft_EDITED 1788256980') remains with a full event trail for inspection.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "/app/memory/test_credentials.md valid - jbenterpriises01@gmail.com / Talbros@2026 works via API and UI. Login submit testid is 'login-submit-button' (not 'login-submit-btn').",
+  "context_for_next_testing_agent": "Run backend suite: cd /app/backend && python -m pytest tests/ -v --junitxml=/app/test_reports/pytest/pytest_results.xml (43 tests, ~12s; pytest.ini forces xdist so -p no:xdist is not allowed). All 3 iteration_1 HIGH bugs (reversed RichEditor typing, missing mobile nav, stale draft on send) are FIXED and verified - do not re-open. Only cosmetic/a11y items remain.",
+  "rca_of_the_issue": "FIX1 root cause (controlled contentEditable re-rendered from state each keystroke) is resolved by writing innerHTML from useEffect only when value !== ref.current.innerHTML. FIX3 root cause (cached createdId, no persistence of later edits) is resolved by PUT /api/simulations/{sid}, which re-validates and rebuilds recipient rows for DRAFT/SCHEDULED sims only."
+}
