@@ -37,24 +37,9 @@ APP_NAME = "TALBROS Security Awareness Center"
 
 app = FastAPI(title=APP_NAME)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+
 
 api = APIRouter(prefix="/api")
-
-
-
-
-
-
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_RE = re.compile(r"^https?://[^\s]+$", re.I)
 
@@ -103,8 +88,8 @@ def set_auth_cookies(response: Response, user_id: str, email: str):
         "access_token",
         at,
         httponly=True,
-        secure=False,
-        samesite="lax",
+        secure=True,
+        samesite="none",
         max_age=43200,
         path="/",
     )
@@ -113,8 +98,8 @@ def set_auth_cookies(response: Response, user_id: str, email: str):
         "refresh_token",
         rt,
         httponly=True,
-        secure=False,
-        samesite="lax",
+        secure=True,
+        samesite="none",
         max_age=604800,
         path="/",
     )
@@ -374,14 +359,195 @@ async def update_recipient(rid: str, body: RecipientBody, user: dict = Depends(g
     await log_audit(user["email"], "RECIPIENT_UPDATED", rid, email)
     return {"ok": True}
 
+@api.delete("/activity/recipient/{srid}")
+async def delete_recipient_activity(
+    srid: str,
+    user: dict = Depends(get_current_user)
+):
+    sr = await db.simulation_recipients.find_one(
+        {"id": srid},
+        {"_id": 0}
+    )
+
+    if not sr:
+        raise HTTPException(status_code=404, detail="Simulation recipient not found")
+
+    await db.simulation_events.delete_many({
+        "recipient_id": srid
+    })
+
+    await db.form_submissions.delete_many({
+        "recipient_id": srid
+    })
+
+    await db.simulation_recipients.update_one(
+        {"id": srid},
+        {"$set": {
+            "open_count": 0,
+            "first_open": None,
+            "last_open": None,
+            "click_count": 0,
+            "first_click": None,
+            "last_click": None,
+            "landing_visited": False,
+            "form_started": False,
+            "form_submitted": False,
+            "form_submitted_at": None,
+            "last_activity": None
+        }}
+    )
+
+    await log_audit(
+        user["email"],
+        "RECIPIENT_ACTIVITY_DELETED",
+        srid,
+        f"Activity deleted for {sr['email']}"
+    )
+
+    return {"ok": True}
+
+
+@api.delete("/activity/simulation/{simulation_id}")
+async def delete_simulation_activity(
+    simulation_id: str,
+    user: dict = Depends(get_current_user)
+):
+    recips = await db.simulation_recipients.find(
+        {"simulation_id": simulation_id},
+        {"_id": 0, "id": 1}
+    ).to_list(50000)
+
+    sr_ids = [r["id"] for r in recips]
+
+    if sr_ids:
+        await db.simulation_events.delete_many({
+            "recipient_id": {"$in": sr_ids}
+        })
+
+        await db.form_submissions.delete_many({
+            "recipient_id": {"$in": sr_ids}
+        })
+
+        await db.simulation_recipients.update_many(
+            {"simulation_id": simulation_id},
+            {"$set": {
+                "open_count": 0,
+                "first_open": None,
+                "last_open": None,
+                "click_count": 0,
+                "first_click": None,
+                "last_click": None,
+                "landing_visited": False,
+                "form_started": False,
+                "form_submitted": False,
+                "form_submitted_at": None,
+                "last_activity": None
+            }}
+        )
+
+    await log_audit(
+        user["email"],
+        "SIMULATION_ACTIVITY_DELETED",
+        simulation_id,
+        f"All activity deleted for simulation {simulation_id}"
+    )
+
+    return {"ok": True}
+
+
+@api.delete("/admin/clear-all-data")
+async def clear_all_data(user: dict = Depends(get_current_user)):
+    collections = [
+        db.simulation_events,
+        db.form_submissions,
+        db.simulation_recipients,
+        db.simulations,
+        db.recipients,
+        db.senders,
+        db.landing_pages,
+        db.forms,
+    ]
+
+    deleted = {}
+
+    for collection in collections:
+        result = await collection.delete_many({})
+        deleted[collection.name] = result.deleted_count
+
+    await log_audit(
+        user["email"],
+        "ALL_OPERATIONAL_DATA_DELETED",
+        "system",
+        "All dashboard operational data deleted"
+    )
+
+    return {
+        "ok": True,
+        "message": "All operational data deleted",
+        "deleted": deleted,
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 @api.delete("/recipients/{rid}")
 async def delete_recipient(rid: str, user: dict = Depends(get_current_user)):
     rec = await db.recipients.find_one({"id": rid}, {"_id": 0})
+
     if not rec:
         raise HTTPException(status_code=404, detail="Recipient not found")
+
+    # Find all simulation-recipient records for this recipient
+    sim_recipients = await db.simulation_recipients.find(
+        {"recipient_id": rid},
+        {"_id": 0, "id": 1, "simulation_id": 1}
+    ).to_list(10000)
+
+    sr_ids = [x["id"] for x in sim_recipients]
+    sim_ids = list({x["simulation_id"] for x in sim_recipients})
+
+    # Delete all tracking/events/form data linked to this recipient
+    if sr_ids:
+        await db.simulation_events.delete_many(
+            {"recipient_id": {"$in": sr_ids}}
+        )
+
+        await db.form_submissions.delete_many(
+            {"recipient_id": {"$in": sr_ids}}
+        )
+
+        await db.simulation_recipients.delete_many(
+            {"recipient_id": rid}
+        )
+
+    # Delete the recipient itself
     await db.recipients.delete_one({"id": rid})
-    await log_audit(user["email"], "RECIPIENT_DELETED", rid, rec["email"])
+
+    # Remove simulations that no longer have any recipients
+    for sim_id in sim_ids:
+        remaining = await db.simulation_recipients.count_documents(
+            {"simulation_id": sim_id}
+        )
+        if remaining == 0:
+            await db.simulations.delete_one({"id": sim_id})
+
+    await log_audit(
+        user["email"],
+        "RECIPIENT_DELETED",
+        rid,
+        f"Recipient and all linked tracking data deleted: {rec['email']}"
+    )
+
     return {"ok": True}
 
 
@@ -690,6 +856,43 @@ async def update_simulation(sid: str, body: SimulationBody, user: dict = Depends
     return updated
 
 
+@api.delete("/simulations/{sid}")
+async def delete_simulation(sid: str, user: dict = Depends(get_current_user)):
+    sim = await db.simulations.find_one({"id": sid}, {"_id": 0})
+    if not sim:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+
+    sr_ids = [
+        r["id"]
+        for r in await db.simulation_recipients.find(
+            {"simulation_id": sid},
+            {"_id": 0, "id": 1}
+        ).to_list(50000)
+    ]
+
+    if sr_ids:
+        await db.simulation_events.delete_many(
+            {"recipient_id": {"$in": sr_ids}}
+        )
+        await db.form_submissions.delete_many(
+            {"recipient_id": {"$in": sr_ids}}
+        )
+
+    await db.simulation_recipients.delete_many({"simulation_id": sid})
+    await db.simulations.delete_one({"id": sid})
+
+    await log_audit(
+        user["email"],
+        "SIMULATION_DELETED",
+        sid,
+        f"Simulation deleted: {sim.get('sim_id', sid)}"
+    )
+
+    return {"ok": True}
+
+
+
+
 @api.get("/simulations")
 async def list_simulations(user: dict = Depends(get_current_user)):
     return await db.simulations.find({}, {"_id": 0}).sort("created_at", -1).to_list(2000)
@@ -930,7 +1133,7 @@ async def track_click(token: str):
 
     if sim and sim.get("landing_page_id") and sim["tracking"].get("landing"):
         return RedirectResponse(
-            url=f"https://actually-computational-jake-calculated.trycloudflare.com/lp/{token}"
+            url=f"https://increasingly-adaptation-cincinnati-favorite.trycloudflare.com/lp/{token}"
         )
 
     dest = (sim.get("destination_url") if sim else "") or PUBLIC_BASE_URL or "/"
@@ -1106,29 +1309,96 @@ def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 
 
 @api.get("/reports/recipient")
-async def report_recipient(simulation_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+async def report_recipient(
+    simulation_id: Optional[str] = None,
+    user: dict = Depends(get_current_user)
+):
     q = {"simulation_id": simulation_id} if simulation_id else {}
-    recips = await db.simulation_recipients.find(q, {"_id": 0}).to_list(50000)
-    sims = {s["id"]: s for s in await db.simulations.find({}, {"_id": 0}).to_list(5000)}
+
+    recips = await db.simulation_recipients.find(
+        q, {"_id": 0}
+    ).to_list(50000)
+
+    sims = {
+        s["id"]: s
+        for s in await db.simulations.find({}, {"_id": 0}).to_list(5000)
+    }
+
     rows = []
+    dynamic_fields = set()
+
     for r in recips:
         s = sims.get(r["simulation_id"], {})
-        rows.append({
-            "simulation_id": s.get("sim_id", ""), "recipient_email": r["email"],
-            "department": r.get("department", ""), "sent": r.get("sent"),
-            "delivered": r.get("delivery_status"), "first_open": r.get("first_open"),
-            "last_open": r.get("last_open"), "open_count": r.get("open_count"),
-            "first_click": r.get("first_click"), "last_click": r.get("last_click"),
-            "click_count": r.get("click_count"), "landing_page_visited": r.get("landing_visited"),
-            "form_started": r.get("form_started"), "form_submitted": r.get("form_submitted"),
-            "submission_time": r.get("form_submitted_at"), "last_activity": r.get("last_activity"),
-        })
-    await log_audit(user["email"], "REPORT_EXPORTED", None, "Recipient report")
-    return csv_response(rows, list(rows[0].keys()) if rows else
-                        ["simulation_id", "recipient_email", "department", "sent", "delivered",
-                         "first_open", "last_open", "open_count", "first_click", "last_click",
-                         "click_count", "landing_page_visited", "form_started", "form_submitted",
-                         "submission_time", "last_activity"], "recipient_report.csv")
+
+        submission = await db.form_submissions.find_one(
+            {
+                "simulation_id": r["simulation_id"],
+                "recipient_id": r["id"]
+            },
+            {"_id": 0},
+            sort=[("timestamp", -1)]
+        )
+
+        responses = submission.get("responses", {}) if submission else {}
+
+        for key in responses.keys():
+            dynamic_fields.add(str(key))
+
+        row = {
+            "simulation_id": s.get("sim_id", ""),
+            "recipient_email": r.get("email", ""),
+            "department": r.get("department", ""),
+            "sent": r.get("sent"),
+            "delivered": r.get("delivery_status"),
+            "first_open": r.get("first_open"),
+            "last_open": r.get("last_open"),
+            "open_count": r.get("open_count"),
+            "first_click": r.get("first_click"),
+            "last_click": r.get("last_click"),
+            "click_count": r.get("click_count"),
+            "landing_page_visited": r.get("landing_visited"),
+            "form_started": r.get("form_started"),
+            "form_submitted": r.get("form_submitted"),
+            "submission_time": r.get("form_submitted_at"),
+            "last_activity": r.get("last_activity"),
+            **responses,
+        }
+
+        rows.append(row)
+
+    base_columns = [
+        "simulation_id",
+        "recipient_email",
+        "department",
+        "sent",
+        "delivered",
+        "first_open",
+        "last_open",
+        "open_count",
+        "first_click",
+        "last_click",
+        "click_count",
+        "landing_page_visited",
+        "form_started",
+        "form_submitted",
+        "submission_time",
+        "last_activity",
+    ]
+
+    columns = base_columns + sorted(dynamic_fields)
+
+    await log_audit(
+        user["email"],
+        "REPORT_EXPORTED",
+        None,
+        "Recipient report"
+    )
+
+    return csv_response(
+        rows,
+        columns,
+        "recipient_report.csv"
+    )
 
 
 @api.get("/reports/department")
