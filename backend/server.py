@@ -25,7 +25,7 @@ from security import (
     hash_password, verify_password, create_access_token, create_refresh_token,
     get_current_user, require_admin,
 )
-from email_service import send_email, assert_safe_email, EMAIL_FROM_NAME
+from email_service import send_email, assert_safe_email
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("talbros")
