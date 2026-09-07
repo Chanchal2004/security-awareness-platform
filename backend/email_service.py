@@ -2,11 +2,9 @@ import os
 import re
 import ipaddress
 import logging
-import smtplib
-import ssl
 
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import requests
+
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
@@ -15,16 +13,11 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Gmail SMTP configuration
+# Brevo configuration
 # ============================================================
 
-GMAIL_SMTP_HOST = "smtp.gmail.com"
-GMAIL_SMTP_PORT = 587
-
-GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-
-EMAIL_FROM_NAME = os.environ["EMAIL_FROM_NAME"]
+BREVO_API_KEY = os.environ["BREVO_API_KEY"]
+EMAIL_FROM_EMAIL = os.environ["EMAIL_FROM_EMAIL"]
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
 
@@ -127,7 +120,6 @@ class _EmailScan(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag.lower() == "a" and self._href is not None:
-
             self.anchors.append(
                 (
                     self._href,
@@ -154,7 +146,7 @@ def assert_safe_email(subject: str, html: str) -> None:
     - misleading links
 
     Localhost HTTP URLs are allowed for local development/testing.
-    Production tracking should use a publicly reachable HTTPS URL.
+    Production tracking should use publicly reachable HTTPS URLs.
     """
 
     scan = _EmailScan()
@@ -181,7 +173,6 @@ def assert_safe_email(subject: str, html: str) -> None:
     # --------------------------------------------------------
 
     for phrase in _CRED_ASK:
-
         if phrase in body:
             raise ValueError(
                 "Email may not ask recipients for passwords or credentials."
@@ -207,9 +198,9 @@ def assert_safe_email(subject: str, html: str) -> None:
             continue
 
         # ----------------------------------------------------
-        # Allow HTTPS URLs.
+        # HTTPS URLs are allowed.
         #
-        # Also allow localhost / 127.0.0.1 for LOCAL TESTING.
+        # localhost / 127.0.0.1 are allowed for local testing.
         # ----------------------------------------------------
 
         if not low.startswith(
@@ -253,7 +244,6 @@ def assert_safe_email(subject: str, html: str) -> None:
             shown = match.group(1).lower()
 
             if not _same_site(shown, real):
-
                 raise ValueError(
                     "Link text must not reference a different website "
                     "than the link target."
@@ -261,7 +251,7 @@ def assert_safe_email(subject: str, html: str) -> None:
 
 
 # ============================================================
-# Send email using Gmail SMTP
+# Send email using Brevo API
 # ============================================================
 
 async def send_email(
@@ -273,13 +263,13 @@ async def send_email(
 ) -> str | None:
 
     """
-    Send an authorized email through the configured Gmail account.
+    Send an authorized email through Brevo API.
 
-    The sender identity is controlled by GMAIL_ADDRESS.
+    Sender identity is controlled by EMAIL_FROM_EMAIL.
     """
 
     # --------------------------------------------------------
-    # Keep existing safety validation
+    # Safety validation
     # --------------------------------------------------------
 
     assert_safe_email(
@@ -288,17 +278,25 @@ async def send_email(
     )
 
     # --------------------------------------------------------
-    # Create email
+    # Brevo API payload
     # --------------------------------------------------------
 
-    message = MIMEMultipart("alternative")
+    payload = {
+        "sender": {
+            "email": EMAIL_FROM_EMAIL,
+        },
+        "to": [
+            {
+                "email": to,
+            }
+        ],
+        "subject": subject,
+        "htmlContent": html,
+    }
 
-    message["From"] = (
-        f"{EMAIL_FROM_NAME} <{GMAIL_ADDRESS}>"
-    )
-
-    message["To"] = to
-    message["Subject"] = subject
+    # --------------------------------------------------------
+    # Optional Reply-To
+    # --------------------------------------------------------
 
     final_reply_to = (
         reply_to
@@ -306,65 +304,57 @@ async def send_email(
     )
 
     if final_reply_to:
-        message["Reply-To"] = final_reply_to
-
-    message.attach(
-        MIMEText(
-            html,
-            "html",
-            "utf-8",
-        )
-    )
+        payload["replyTo"] = {
+            "email": final_reply_to,
+        }
 
     # --------------------------------------------------------
-    # Gmail TLS context
+    # Brevo API request
     # --------------------------------------------------------
 
-    context = ssl.create_default_context()
-
-    # --------------------------------------------------------
-    # SMTP connection
-    # --------------------------------------------------------
+    headers = {
+        "accept": "application/json",
+        "api-key": BREVO_API_KEY,
+        "content-type": "application/json",
+    }
 
     try:
 
-        with smtplib.SMTP(
-            GMAIL_SMTP_HOST,
-            GMAIL_SMTP_PORT,
+        response = requests.post(
+            "https://api.brevo.com/v3/smtp/email",
+            headers=headers,
+            json=payload,
             timeout=30,
-        ) as smtp:
+        )
 
-            smtp.ehlo()
+        # ----------------------------------------------------
+        # Check Brevo response
+        # ----------------------------------------------------
 
-            smtp.starttls(
-                context=context
+        if not response.ok:
+            logger.error(
+                "Brevo email failed for %s: %s %s",
+                to,
+                response.status_code,
+                response.text,
             )
 
-            smtp.ehlo()
+            response.raise_for_status()
 
-            smtp.login(
-                GMAIL_ADDRESS,
-                GMAIL_APP_PASSWORD,
-            )
+        data = response.json()
 
-            smtp.sendmail(
-                GMAIL_ADDRESS,
-                [to],
-                message.as_string(),
-            )
+        message_id = data.get("messageId")
 
         logger.info(
-            "Email sent successfully to %s",
+            "Email sent successfully to %s via Brevo",
             to,
         )
 
-        return None
+        return message_id
 
     except Exception:
-
         logger.exception(
-            "Gmail SMTP send failed for %s",
+            "Brevo API send failed for %s",
             to,
         )
-
         raise
