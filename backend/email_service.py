@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 BREVO_API_KEY = os.environ["BREVO_API_KEY"]
-EMAIL_FROM_EMAIL = os.environ["EMAIL_FROM_EMAIL"]
+EMAIL_FROM_NAME = os.environ["EMAIL_FROM_NAME"]
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
 
@@ -265,7 +265,7 @@ async def send_email(
     """
     Send an authorized email through Brevo API.
 
-    Sender identity is controlled by EMAIL_FROM_EMAIL.
+    Sender identity is controlled by EMAIL_FROM_NAME.
     """
 
     # --------------------------------------------------------
@@ -283,7 +283,7 @@ async def send_email(
 
     payload = {
         "sender": {
-            "email": EMAIL_FROM_EMAIL,
+            "email": EMAIL_FROM_NAME,
         },
         "to": [
             {
