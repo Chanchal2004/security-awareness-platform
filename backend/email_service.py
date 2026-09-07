@@ -17,7 +17,14 @@ logger = logging.getLogger(__name__)
 # ============================================================
 
 BREVO_API_KEY = os.environ["BREVO_API_KEY"]
-EMAIL_FROM_NAME = os.environ["EMAIL_FROM_NAME"]
+
+EMAIL_FROM_EMAIL = os.environ["EMAIL_FROM_EMAIL"]
+
+EMAIL_FROM_NAME = os.environ.get(
+    "EMAIL_FROM_NAME",
+    "Security Awareness Platform",
+)
+
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
 
@@ -98,7 +105,9 @@ class _EmailScan(HTMLParser):
         self._text = []
 
     def handle_starttag(self, tag, attrs):
-        self.tags.add(tag.lower())
+        tag = tag.lower()
+
+        self.tags.add(tag)
 
         self.urls += [
             value
@@ -106,7 +115,7 @@ class _EmailScan(HTMLParser):
             if key.lower() in ("href", "src") and value
         ]
 
-        if tag.lower() == "a":
+        if tag == "a":
             self._href = dict(
                 (key.lower(), value)
                 for key, value in attrs
@@ -120,6 +129,7 @@ class _EmailScan(HTMLParser):
 
     def handle_endtag(self, tag):
         if tag.lower() == "a" and self._href is not None:
+
             self.anchors.append(
                 (
                     self._href,
@@ -144,9 +154,6 @@ def assert_safe_email(subject: str, html: str) -> None:
     - password requests
     - unsafe URLs
     - misleading links
-
-    Localhost HTTP URLs are allowed for local development/testing.
-    Production tracking should use publicly reachable HTTPS URLs.
     """
 
     scan = _EmailScan()
@@ -173,9 +180,11 @@ def assert_safe_email(subject: str, html: str) -> None:
     # --------------------------------------------------------
 
     for phrase in _CRED_ASK:
+
         if phrase in body:
             raise ValueError(
-                "Email may not ask recipients for passwords or credentials."
+                "Email may not ask recipients for passwords "
+                "or credentials."
             )
 
     # --------------------------------------------------------
@@ -197,12 +206,8 @@ def assert_safe_email(subject: str, html: str) -> None:
         ):
             continue
 
-        # ----------------------------------------------------
-        # HTTPS URLs are allowed.
-        #
-        # localhost / 127.0.0.1 are allowed for local testing.
-        # ----------------------------------------------------
-
+        # HTTPS URLs allowed.
+        # Localhost allowed for local development/testing.
         if not low.startswith(
             (
                 "https://",
@@ -211,7 +216,8 @@ def assert_safe_email(subject: str, html: str) -> None:
             )
         ):
             raise ValueError(
-                "All email links and images must be absolute https URLs."
+                "All email links and images must be absolute "
+                "https URLs."
             )
 
         parsed = urlparse(low)
@@ -220,7 +226,8 @@ def assert_safe_email(subject: str, html: str) -> None:
 
         if not _host_ok(host) or parsed.username is not None:
             raise ValueError(
-                "Shortened, numeric-host or credential-bearing URLs are not allowed."
+                "Shortened, numeric-host or credential-bearing "
+                "URLs are not allowed."
             )
 
     # --------------------------------------------------------
@@ -244,9 +251,10 @@ def assert_safe_email(subject: str, html: str) -> None:
             shown = match.group(1).lower()
 
             if not _same_site(shown, real):
+
                 raise ValueError(
-                    "Link text must not reference a different website "
-                    "than the link target."
+                    "Link text must not reference a different "
+                    "website than the link target."
                 )
 
 
@@ -265,7 +273,9 @@ async def send_email(
     """
     Send an authorized email through Brevo API.
 
-    Sender identity is controlled by EMAIL_FROM_NAME.
+    Sender identity:
+    - EMAIL_FROM_EMAIL = actual sender email
+    - EMAIL_FROM_NAME = displayed sender name
     """
 
     # --------------------------------------------------------
@@ -283,7 +293,8 @@ async def send_email(
 
     payload = {
         "sender": {
-            "email": EMAIL_FROM_NAME,
+            "email": EMAIL_FROM_EMAIL,
+            "name": EMAIL_FROM_NAME,
         },
         "to": [
             {
@@ -304,12 +315,13 @@ async def send_email(
     )
 
     if final_reply_to:
+
         payload["replyTo"] = {
             "email": final_reply_to,
         }
 
     # --------------------------------------------------------
-    # Brevo API request
+    # Brevo API headers
     # --------------------------------------------------------
 
     headers = {
@@ -317,6 +329,10 @@ async def send_email(
         "api-key": BREVO_API_KEY,
         "content-type": "application/json",
     }
+
+    # --------------------------------------------------------
+    # Send request
+    # --------------------------------------------------------
 
     try:
 
@@ -332,6 +348,7 @@ async def send_email(
         # ----------------------------------------------------
 
         if not response.ok:
+
             logger.error(
                 "Brevo email failed for %s: %s %s",
                 to,
@@ -353,8 +370,10 @@ async def send_email(
         return message_id
 
     except Exception:
+
         logger.exception(
             "Brevo API send failed for %s",
             to,
         )
+
         raise
