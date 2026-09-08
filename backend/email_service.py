@@ -2,6 +2,7 @@ import os
 import re
 import ipaddress
 import logging
+import json
 import base64
 
 from email.mime.text import MIMEText
@@ -11,6 +12,7 @@ from html.parser import HTMLParser
 from urllib.parse import urlparse
 
 from google.oauth2.credentials import Credentials
+from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 
 
@@ -21,9 +23,25 @@ logger = logging.getLogger(__name__)
 # GMAIL API CONFIG
 # ============================================================
 
-GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
-GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
-GMAIL_TOKEN_JSON = os.environ["GMAIL_TOKEN_JSON"]
+# Render Environment Variable:
+#
+# GMAIL_TOKEN_JSON
+#
+# Value = COMPLETE contents of token.json
+#
+# Example:
+# {
+#   "token": "...",
+#   "refresh_token": "...",
+#   "token_uri": "https://oauth2.googleapis.com/token",
+#   "client_id": "...",
+#   "client_secret": "...",
+#   "scopes": [
+#       "https://www.googleapis.com/auth/gmail.send"
+#   ]
+# }
+
+GMAIL_TOKEN_JSON = os.environ.get("GMAIL_TOKEN_JSON")
 
 EMAIL_FROM = os.environ["EMAIL_FROM"]
 
@@ -33,7 +51,6 @@ EMAIL_FROM_NAME = os.environ.get(
 )
 
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
-
 
 GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send"
@@ -277,14 +294,73 @@ def assert_safe_email(
 
 def _get_gmail_service():
 
-    credentials = Credentials(
-        token=None,
-        refresh_token=GMAIL_REFRESH_TOKEN,
-        token_uri="https://oauth2.googleapis.com/token",
-        client_id=GMAIL_CLIENT_ID,
-        client_secret=GMAIL_CLIENT_SECRET,
-        scopes=GMAIL_SCOPES,
-    )
+    if not GMAIL_TOKEN_JSON:
+
+        raise RuntimeError(
+            "GMAIL_TOKEN_JSON is not set in Render Environment Variables."
+        )
+
+    try:
+
+        token_data = json.loads(
+            GMAIL_TOKEN_JSON
+        )
+
+    except json.JSONDecodeError as exc:
+
+        raise RuntimeError(
+            f"GMAIL_TOKEN_JSON is not valid JSON: {exc}"
+        ) from exc
+
+    try:
+
+        credentials = Credentials.from_authorized_user_info(
+            token_data,
+            GMAIL_SCOPES,
+        )
+
+    except Exception as exc:
+
+        raise RuntimeError(
+            f"Could not load Gmail credentials from "
+            f"GMAIL_TOKEN_JSON: {exc}"
+        ) from exc
+
+    # --------------------------------------------------------
+    # Refresh expired access token using refresh_token
+    # contained inside token.json.
+    # --------------------------------------------------------
+
+    if (
+        credentials.expired
+        and credentials.refresh_token
+    ):
+
+        try:
+
+            credentials.refresh(
+                Request()
+            )
+
+            logger.info(
+                "Gmail access token refreshed successfully."
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Gmail token refresh failed."
+            )
+
+            raise RuntimeError(
+                f"Gmail token refresh failed: {exc}"
+            ) from exc
+
+    if not credentials.valid:
+
+        raise RuntimeError(
+            "Gmail credentials are invalid or expired."
+        )
 
     service = build(
         "gmail",
@@ -320,16 +396,23 @@ async def send_email(
 
     try:
 
-        message = MIMEMultipart("alternative")
+        message = MIMEMultipart(
+            "alternative"
+        )
 
         message["To"] = to
+
         message["From"] = (
             f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
         )
+
         message["Subject"] = subject
 
         if final_reply_to:
-            message["Reply-To"] = final_reply_to
+
+            message["Reply-To"] = (
+                final_reply_to
+            )
 
         html_part = MIMEText(
             html,
@@ -337,13 +420,20 @@ async def send_email(
             "utf-8",
         )
 
-        message.attach(html_part)
+        message.attach(
+            html_part
+        )
 
-        raw_message = base64.urlsafe_b64encode(
-            message.as_bytes()
-        ).decode()
+        raw_message = (
+            base64.urlsafe_b64encode(
+                message.as_bytes()
+            )
+            .decode()
+        )
 
-        gmail_service = _get_gmail_service()
+        gmail_service = (
+            _get_gmail_service()
+        )
 
         result = (
             gmail_service
@@ -358,7 +448,9 @@ async def send_email(
             .execute()
         )
 
-        message_id = result.get("id")
+        message_id = result.get(
+            "id"
+        )
 
         logger.info(
             "Email sent successfully to %s via Gmail API "
