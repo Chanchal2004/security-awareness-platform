@@ -1133,7 +1133,8 @@ async def track_click(token: str):
 
     if sim and sim.get("landing_page_id") and sim["tracking"].get("landing"):
         return RedirectResponse(
-            url=f"{PUBLIC_BASE_URL}/lp/{token}"
+            url=f"{PUBLIC_BASE_URL}/api/public/landing/{token}"
+
         )
 
     dest = (sim.get("destination_url") if sim else "") or PUBLIC_BASE_URL or "/"
