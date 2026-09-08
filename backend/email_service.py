@@ -13,26 +13,19 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Brevo configuration
+# MailerSend configuration
 # ============================================================
 
-BREVO_API_KEY = os.environ["BREVO_API_KEY"]
+MAILERSEND_API_KEY = os.environ["MAILERSEND_API_KEY"]
 
 # IMPORTANT:
-# EMAIL_FROM must be the actual sender email address verified
-# in Brevo.
+# This must be a MailerSend-approved/verified sender address.
 #
-# Example:
-# EMAIL_FROM=yourverifiedemail@gmail.com
-#
-EMAIL_FROM = os.environ["EMAIL_FROM"]
+# In Sandbox mode, use the sender/from address associated with
+# the MailerSend trial/sandbox domain.
+MAILERSEND_FROM_EMAIL = os.environ["MAILERSEND_FROM_EMAIL"]
 
-# This is only the display name shown to the recipient.
-#
-# Example:
-# EMAIL_FROM_NAME=Talbros Security Awareness
-#
-# Optional so the app does not crash if it is not configured.
+# Display name shown to the recipient.
 EMAIL_FROM_NAME = os.environ.get(
     "EMAIL_FROM_NAME",
     "Talbros Security Awareness",
@@ -48,10 +41,10 @@ EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
 # NEVER print the complete API key.
 logger.info(
-    "Brevo configuration loaded: key_prefix=%s key_length=%d from=%s",
-    BREVO_API_KEY[:8],
-    len(BREVO_API_KEY),
-    EMAIL_FROM,
+    "MailerSend configuration loaded: key_prefix=%s key_length=%d from=%s",
+    MAILERSEND_API_KEY[:8],
+    len(MAILERSEND_API_KEY),
+    MAILERSEND_FROM_EMAIL,
 )
 
 
@@ -69,6 +62,7 @@ _SHORTENERS = (
     "rebrand.ly",
 )
 
+
 _CRED_ASK = (
     "reply with your password",
     "reply with the code",
@@ -84,6 +78,7 @@ _CRED_ASK = (
     "social security number",
     "confirm your bank details",
 )
+
 
 _HOSTISH = re.compile(
     r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})",
@@ -148,11 +143,13 @@ class _EmailScan(HTMLParser):
         self._text = []
 
     def handle_starttag(self, tag, attrs):
+
         tag_lower = tag.lower()
 
         self.tags.add(tag_lower)
 
         for key, value in attrs:
+
             if (
                 key.lower() in ("href", "src")
                 and value
@@ -170,14 +167,17 @@ class _EmailScan(HTMLParser):
             self._text = []
 
     def handle_data(self, data):
+
         if self._href is not None:
             self._text.append(data)
 
     def handle_endtag(self, tag):
+
         if (
             tag.lower() == "a"
             and self._href is not None
         ):
+
             self.anchors.append(
                 (
                     self._href,
@@ -197,6 +197,7 @@ def assert_safe_email(
     subject: str,
     html: str,
 ) -> None:
+
     """
     Validate email content before delivery.
 
@@ -212,6 +213,7 @@ def assert_safe_email(
     """
 
     scan = _EmailScan()
+
     scan.feed(html)
 
     # --------------------------------------------------------
@@ -226,6 +228,7 @@ def assert_safe_email(
     }
 
     if scan.tags & forbidden_tags:
+
         raise ValueError(
             "Email templates may not contain forms "
             "or input fields."
@@ -242,6 +245,7 @@ def assert_safe_email(
     for phrase in _CRED_ASK:
 
         if phrase in body:
+
             raise ValueError(
                 "Email may not ask recipients for "
                 "passwords or credentials."
@@ -277,6 +281,7 @@ def assert_safe_email(
                 "http://127.0.0.1:",
             )
         ):
+
             raise ValueError(
                 "All email links and images must be "
                 "absolute https URLs."
@@ -290,11 +295,13 @@ def assert_safe_email(
         # - shortened URLs
         # - numeric hosts
         # - credential-bearing URLs
+
         if (
             not _host_ok(host)
             or parsed.username is not None
             or parsed.password is not None
         ):
+
             raise ValueError(
                 "Shortened, numeric-host or "
                 "credential-bearing URLs are not allowed."
@@ -324,6 +331,7 @@ def assert_safe_email(
                 shown,
                 real,
             ):
+
                 raise ValueError(
                     "Link text must not reference a "
                     "different website than the link target."
@@ -331,7 +339,7 @@ def assert_safe_email(
 
 
 # ============================================================
-# Send email using Brevo API
+# Send email using MailerSend API
 # ============================================================
 
 async def send_email(
@@ -343,13 +351,13 @@ async def send_email(
 ) -> str | None:
 
     """
-    Send an authorized email through Brevo API.
-
-    EMAIL_FROM
-        Actual verified sender email address.
+    Send an email through MailerSend API.
 
     EMAIL_FROM_NAME
         Display name shown to recipient.
+
+    MAILERSEND_FROM_EMAIL
+        Verified/approved MailerSend sender address.
 
     EMAIL_REPLY_TO
         Optional reply-to address.
@@ -365,21 +373,24 @@ async def send_email(
     )
 
     # --------------------------------------------------------
-    # Brevo API payload
+    # MailerSend API payload
     # --------------------------------------------------------
 
     payload = {
-        "sender": {
-            "email": EMAIL_FROM,
+        "from": {
+            "email": MAILERSEND_FROM_EMAIL,
             "name": EMAIL_FROM_NAME,
         },
+
         "to": [
             {
                 "email": to,
             }
         ],
+
         "subject": subject,
-        "htmlContent": html,
+
+        "html": html,
     }
 
     # --------------------------------------------------------
@@ -393,41 +404,43 @@ async def send_email(
 
     if final_reply_to:
 
-        payload["replyTo"] = {
+        payload["reply_to"] = {
             "email": final_reply_to,
         }
 
     # --------------------------------------------------------
-    # Brevo API headers
+    # MailerSend API headers
     # --------------------------------------------------------
 
     headers = {
         "accept": "application/json",
-        "api-key": BREVO_API_KEY,
+        "authorization": (
+            f"Bearer {MAILERSEND_API_KEY}"
+        ),
         "content-type": "application/json",
     }
 
     # --------------------------------------------------------
-    # Brevo API request
+    # MailerSend API request
     # --------------------------------------------------------
 
     try:
 
         response = requests.post(
-            "https://api.brevo.com/v3/smtp/email",
+            "https://api.mailersend.com/v1/email",
             headers=headers,
             json=payload,
             timeout=30,
         )
 
         # ----------------------------------------------------
-        # Check Brevo response
+        # Check MailerSend response
         # ----------------------------------------------------
 
         if not response.ok:
 
             logger.error(
-                "Brevo email failed for %s: %s %s",
+                "MailerSend email failed for %s: %s %s",
                 to,
                 response.status_code,
                 response.text,
@@ -436,18 +449,19 @@ async def send_email(
             response.raise_for_status()
 
         # ----------------------------------------------------
-        # Parse successful response
+        # MailerSend returns 202 Accepted and the message ID
+        # in the x-message-id response header.
         # ----------------------------------------------------
 
-        data = response.json()
-
-        message_id = data.get(
-            "messageId"
+        message_id = response.headers.get(
+            "x-message-id"
         )
 
         logger.info(
-            "Email sent successfully to %s via Brevo",
+            "Email sent successfully to %s via MailerSend "
+            "message_id=%s",
             to,
+            message_id,
         )
 
         return message_id
@@ -455,7 +469,7 @@ async def send_email(
     except Exception:
 
         logger.exception(
-            "Brevo API send failed for %s",
+            "MailerSend API send failed for %s",
             to,
         )
 
