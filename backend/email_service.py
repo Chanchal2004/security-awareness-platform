@@ -16,14 +16,18 @@ logger = logging.getLogger(__name__)
 # MailerSend configuration
 # ============================================================
 
-MAILERSEND_API_KEY = os.environ["MAILERSEND_API_KEY"]
+MAILERSEND_API_TOKEN = os.environ["MAILERSEND_API_TOKEN"]
 
 # IMPORTANT:
-# This must be a MailerSend-approved/verified sender address.
+# This MUST be an email address belonging to a VERIFIED
+# MailerSend sending domain.
 #
-# In Sandbox mode, use the sender/from address associated with
-# the MailerSend trial/sandbox domain.
-MAILERSEND_FROM_EMAIL = os.environ["MAILERSEND_FROM_EMAIL"]
+# Example:
+# EMAIL_FROM=security@test-xkjn41modd64z781.mlsender.net
+#
+# DO NOT use your Gmail address here unless that domain
+# is actually verified by MailerSend.
+EMAIL_FROM = os.environ["EMAIL_FROM"]
 
 # Display name shown to the recipient.
 EMAIL_FROM_NAME = os.environ.get(
@@ -39,12 +43,12 @@ EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 # Safe API-key diagnostic
 # ============================================================
 
-# NEVER print the complete API key.
+# NEVER print the complete API token.
 logger.info(
-    "MailerSend configuration loaded: key_prefix=%s key_length=%d from=%s",
-    MAILERSEND_API_KEY[:8],
-    len(MAILERSEND_API_KEY),
-    MAILERSEND_FROM_EMAIL,
+    "MailerSend configuration loaded: token_prefix=%s token_length=%d from=%s",
+    MAILERSEND_API_TOKEN[:8],
+    len(MAILERSEND_API_TOKEN),
+    EMAIL_FROM,
 )
 
 
@@ -62,7 +66,6 @@ _SHORTENERS = (
     "rebrand.ly",
 )
 
-
 _CRED_ASK = (
     "reply with your password",
     "reply with the code",
@@ -78,7 +81,6 @@ _CRED_ASK = (
     "social security number",
     "confirm your bank details",
 )
-
 
 _HOSTISH = re.compile(
     r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})",
@@ -131,7 +133,6 @@ def _same_site(shown: str, real: str) -> bool:
 # ============================================================
 
 class _EmailScan(HTMLParser):
-
     def __init__(self):
         super().__init__()
 
@@ -143,13 +144,11 @@ class _EmailScan(HTMLParser):
         self._text = []
 
     def handle_starttag(self, tag, attrs):
-
         tag_lower = tag.lower()
 
         self.tags.add(tag_lower)
 
         for key, value in attrs:
-
             if (
                 key.lower() in ("href", "src")
                 and value
@@ -157,7 +156,6 @@ class _EmailScan(HTMLParser):
                 self.urls.append(value)
 
         if tag_lower == "a":
-
             attributes = {
                 key.lower(): value
                 for key, value in attrs
@@ -167,17 +165,14 @@ class _EmailScan(HTMLParser):
             self._text = []
 
     def handle_data(self, data):
-
         if self._href is not None:
             self._text.append(data)
 
     def handle_endtag(self, tag):
-
         if (
             tag.lower() == "a"
             and self._href is not None
         ):
-
             self.anchors.append(
                 (
                     self._href,
@@ -197,7 +192,6 @@ def assert_safe_email(
     subject: str,
     html: str,
 ) -> None:
-
     """
     Validate email content before delivery.
 
@@ -213,7 +207,6 @@ def assert_safe_email(
     """
 
     scan = _EmailScan()
-
     scan.feed(html)
 
     # --------------------------------------------------------
@@ -228,7 +221,6 @@ def assert_safe_email(
     }
 
     if scan.tags & forbidden_tags:
-
         raise ValueError(
             "Email templates may not contain forms "
             "or input fields."
@@ -245,7 +237,6 @@ def assert_safe_email(
     for phrase in _CRED_ASK:
 
         if phrase in body:
-
             raise ValueError(
                 "Email may not ask recipients for "
                 "passwords or credentials."
@@ -281,7 +272,6 @@ def assert_safe_email(
                 "http://127.0.0.1:",
             )
         ):
-
             raise ValueError(
                 "All email links and images must be "
                 "absolute https URLs."
@@ -295,13 +285,11 @@ def assert_safe_email(
         # - shortened URLs
         # - numeric hosts
         # - credential-bearing URLs
-
         if (
             not _host_ok(host)
             or parsed.username is not None
             or parsed.password is not None
         ):
-
             raise ValueError(
                 "Shortened, numeric-host or "
                 "credential-bearing URLs are not allowed."
@@ -331,7 +319,6 @@ def assert_safe_email(
                 shown,
                 real,
             ):
-
                 raise ValueError(
                     "Link text must not reference a "
                     "different website than the link target."
@@ -349,15 +336,15 @@ async def send_email(
     html: str,
     reply_to: str | None = None,
 ) -> str | None:
-
     """
-    Send an email through MailerSend API.
+    Send an authorized email through MailerSend API.
+
+    EMAIL_FROM
+        Actual sender email address belonging to a
+        verified MailerSend domain.
 
     EMAIL_FROM_NAME
         Display name shown to recipient.
-
-    MAILERSEND_FROM_EMAIL
-        Verified/approved MailerSend sender address.
 
     EMAIL_REPLY_TO
         Optional reply-to address.
@@ -378,18 +365,15 @@ async def send_email(
 
     payload = {
         "from": {
-            "email": MAILERSEND_FROM_EMAIL,
+            "email": EMAIL_FROM,
             "name": EMAIL_FROM_NAME,
         },
-
         "to": [
             {
                 "email": to,
             }
         ],
-
         "subject": subject,
-
         "html": html,
     }
 
@@ -403,21 +387,20 @@ async def send_email(
     )
 
     if final_reply_to:
-
-        payload["reply_to"] = {
-            "email": final_reply_to,
-        }
+        payload["reply_to"] = [
+            {
+                "email": final_reply_to,
+            }
+        ]
 
     # --------------------------------------------------------
     # MailerSend API headers
     # --------------------------------------------------------
 
     headers = {
-        "accept": "application/json",
-        "authorization": (
-            f"Bearer {MAILERSEND_API_KEY}"
-        ),
-        "content-type": "application/json",
+        "Authorization": f"Bearer {MAILERSEND_API_TOKEN}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
     }
 
     # --------------------------------------------------------
@@ -449,8 +432,8 @@ async def send_email(
             response.raise_for_status()
 
         # ----------------------------------------------------
-        # MailerSend returns 202 Accepted and the message ID
-        # in the x-message-id response header.
+        # MailerSend normally returns 202 Accepted.
+        # The response may not contain JSON/messageId.
         # ----------------------------------------------------
 
         message_id = response.headers.get(
@@ -458,10 +441,8 @@ async def send_email(
         )
 
         logger.info(
-            "Email sent successfully to %s via MailerSend "
-            "message_id=%s",
+            "Email sent successfully to %s via MailerSend",
             to,
-            message_id,
         )
 
         return message_id
