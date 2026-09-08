@@ -1126,7 +1126,10 @@ async def track_click(token: str):
     if not sr:
         return RedirectResponse(url=PUBLIC_BASE_URL or "/")
 
-    sim = await db.simulations.find_one({"id": sr["simulation_id"]}, {"_id": 0})
+    sim = await db.simulations.find_one(
+        {"id": sr["simulation_id"]},
+        {"_id": 0}
+    )
 
     if sim and sim["tracking"].get("click"):
         await apply_event(sr, sr["simulation_id"], "LINK_CLICKED")
@@ -1134,12 +1137,11 @@ async def track_click(token: str):
     if sim and sim.get("landing_page_id") and sim["tracking"].get("landing"):
         return RedirectResponse(
             url=f"{PUBLIC_BASE_URL}/api/public/landing/{token}"
-
         )
 
     dest = (sim.get("destination_url") if sim else "") or PUBLIC_BASE_URL or "/"
     return RedirectResponse(url=dest)
-
+    
 @api.get("/public/landing/{token}")
 async def public_landing(token: str):
     sr = await db.simulation_recipients.find_one({"token": token}, {"_id": 0})
