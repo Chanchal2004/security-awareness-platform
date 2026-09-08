@@ -1,3 +1,4 @@
+
 import os
 import re
 import ipaddress
@@ -13,46 +14,30 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# Resend configuration
+# POSTMARK CONFIG
 # ============================================================
 
-RESEND_API_KEY = os.environ["RESEND_API_KEY"]
+POSTMARK_SERVER_TOKEN = os.environ["POSTMARK_SERVER_TOKEN"]
 
-# This MUST be an email address belonging to a
-# VERIFIED domain in Resend.
-#
-# Example:
-# EMAIL_FROM=security@yourdomain.com
-#
-# Do NOT use an arbitrary Gmail address unless
-# Resend has explicitly verified it as a sender.
 EMAIL_FROM = os.environ["EMAIL_FROM"]
 
-# Display name shown to the recipient.
 EMAIL_FROM_NAME = os.environ.get(
     "EMAIL_FROM_NAME",
     "Talbros Security Awareness",
 )
 
-# Optional Reply-To address.
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
+POSTMARK_URL = "https://api.postmarkapp.com/email"
 
-# ============================================================
-# Safe API-key diagnostic
-# ============================================================
-
-# NEVER print the complete API key.
-logger.info(
-    "Resend configuration loaded: key_prefix=%s key_length=%d from=%s",
-    RESEND_API_KEY[:8],
-    len(RESEND_API_KEY),
-    EMAIL_FROM,
+MESSAGE_STREAM = os.environ.get(
+    "POSTMARK_MESSAGE_STREAM",
+    "outbound",
 )
 
 
 # ============================================================
-# Safety rules
+# EMAIL SAFETY VALIDATION
 # ============================================================
 
 _SHORTENERS = (
@@ -89,30 +74,20 @@ _HOSTISH = re.compile(
 )
 
 
-# ============================================================
-# URL validation
-# ============================================================
-
 def _host_ok(host: str) -> bool:
-    """
-    Return True when a URL host is acceptable.
-    """
 
     if not host:
         return False
 
-    # Reject internationalized/punycode hosts.
     if "xn--" in host:
         return False
 
-    # Reject numeric IP addresses.
     try:
         ipaddress.ip_address(host)
         return False
     except ValueError:
         pass
 
-    # Reject known URL shorteners.
     return not any(
         host == shortener
         or host.endswith("." + shortener)
@@ -121,10 +96,6 @@ def _host_ok(host: str) -> bool:
 
 
 def _same_site(shown: str, real: str) -> bool:
-    """
-    Check whether visible link text and actual destination
-    refer to the same site.
-    """
 
     return (
         shown == real
@@ -133,13 +104,10 @@ def _same_site(shown: str, real: str) -> bool:
     )
 
 
-# ============================================================
-# HTML scanner
-# ============================================================
-
 class _EmailScan(HTMLParser):
 
     def __init__(self):
+
         super().__init__()
 
         self.tags = set()
@@ -196,35 +164,14 @@ class _EmailScan(HTMLParser):
             self._text = []
 
 
-# ============================================================
-# Email safety validation
-# ============================================================
-
 def assert_safe_email(
     subject: str,
     html: str,
 ) -> None:
-    """
-    Validate email content before delivery.
-
-    Emails cannot contain:
-
-    - credential-collection forms
-    - password requests
-    - unsafe URLs
-    - misleading links
-
-    Localhost HTTP URLs are allowed for local
-    development/testing.
-    """
 
     scan = _EmailScan()
 
     scan.feed(html)
-
-    # --------------------------------------------------------
-    # No forms/input fields in email templates
-    # --------------------------------------------------------
 
     forbidden_tags = {
         "form",
@@ -240,13 +187,7 @@ def assert_safe_email(
             "or input fields."
         )
 
-    body = (
-        f"{subject}\n{html}"
-    ).lower()
-
-    # --------------------------------------------------------
-    # No credential requests
-    # --------------------------------------------------------
+    body = f"{subject}\n{html}".lower()
 
     for phrase in _CRED_ASK:
 
@@ -257,15 +198,10 @@ def assert_safe_email(
                 "passwords or credentials."
             )
 
-    # --------------------------------------------------------
-    # Validate URLs
-    # --------------------------------------------------------
-
     for url in scan.urls:
 
         low = url.strip().lower()
 
-        # Safe non-web URLs.
         if low.startswith(
             (
                 "mailto:",
@@ -276,10 +212,6 @@ def assert_safe_email(
         ):
             continue
 
-        # HTTPS URLs are allowed.
-        #
-        # localhost / 127.0.0.1 are allowed only for
-        # local development/testing.
         if not low.startswith(
             (
                 "https://",
@@ -297,10 +229,6 @@ def assert_safe_email(
 
         host = parsed.hostname or ""
 
-        # Reject:
-        # - shortened URLs
-        # - numeric hosts
-        # - credential-bearing URLs
         if (
             not _host_ok(host)
             or parsed.username is not None
@@ -311,10 +239,6 @@ def assert_safe_email(
                 "Shortened, numeric-host or "
                 "credential-bearing URLs are not allowed."
             )
-
-    # --------------------------------------------------------
-    # Validate visible link text vs actual destination
-    # --------------------------------------------------------
 
     for href, text in scan.anchors:
 
@@ -344,7 +268,7 @@ def assert_safe_email(
 
 
 # ============================================================
-# Send email using Resend API
+# SEND EMAIL WITH POSTMARK
 # ============================================================
 
 async def send_email(
@@ -354,43 +278,23 @@ async def send_email(
     html: str,
     reply_to: str | None = None,
 ) -> str | None:
-    """
-    Send an authorized email through Resend API.
-
-    EMAIL_FROM
-        Actual sender email address belonging to a
-        verified Resend domain.
-
-    EMAIL_FROM_NAME
-        Display name shown to recipient.
-
-    EMAIL_REPLY_TO
-        Optional reply-to address.
-    """
-
-    # --------------------------------------------------------
-    # Safety validation
-    # --------------------------------------------------------
 
     assert_safe_email(
         subject,
         html,
     )
 
-    # --------------------------------------------------------
-    # Resend API payload
-    # --------------------------------------------------------
+    from_address = (
+        f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
+    )
 
     payload = {
-        "from": f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>",
-        "to": [to],
-        "subject": subject,
-        "html": html,
+        "From": from_address,
+        "To": to,
+        "Subject": subject,
+        "HtmlBody": html,
+        "MessageStream": MESSAGE_STREAM,
     }
-
-    # --------------------------------------------------------
-    # Optional Reply-To
-    # --------------------------------------------------------
 
     final_reply_to = (
         reply_to
@@ -399,39 +303,27 @@ async def send_email(
 
     if final_reply_to:
 
-        payload["reply_to"] = final_reply_to
-
-    # --------------------------------------------------------
-    # Resend API headers
-    # --------------------------------------------------------
+        payload["ReplyTo"] = final_reply_to
 
     headers = {
-        "Authorization": f"Bearer {RESEND_API_KEY}",
-        "Content-Type": "application/json",
         "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Postmark-Server-Token": POSTMARK_SERVER_TOKEN,
     }
-
-    # --------------------------------------------------------
-    # Resend API request
-    # --------------------------------------------------------
 
     try:
 
         response = requests.post(
-            "https://api.resend.com/emails",
+            POSTMARK_URL,
             headers=headers,
             json=payload,
             timeout=30,
         )
 
-        # ----------------------------------------------------
-        # Check Resend response
-        # ----------------------------------------------------
-
         if not response.ok:
 
             logger.error(
-                "Resend email failed for %s: %s %s",
+                "Postmark email failed for %s: %s %s",
                 to,
                 response.status_code,
                 response.text,
@@ -439,17 +331,15 @@ async def send_email(
 
             response.raise_for_status()
 
-        # ----------------------------------------------------
-        # Resend returns JSON containing id
-        # ----------------------------------------------------
-
         data = response.json()
 
-        message_id = data.get("id")
+        message_id = data.get("MessageID")
 
         logger.info(
-            "Email sent successfully to %s via Resend",
+            "Email sent successfully to %s via Postmark "
+            "(MessageID=%s)",
             to,
+            message_id,
         )
 
         return message_id
@@ -457,7 +347,7 @@ async def send_email(
     except Exception:
 
         logger.exception(
-            "Resend API send failed for %s",
+            "Postmark API send failed for %s",
             to,
         )
 
