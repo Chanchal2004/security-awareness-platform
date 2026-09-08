@@ -1,23 +1,29 @@
-
 import os
 import re
 import ipaddress
 import logging
+import base64
 
-import requests
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 from html.parser import HTMLParser
 from urllib.parse import urlparse
+
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
 
 
 logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# POSTMARK CONFIG
+# GMAIL API CONFIG
 # ============================================================
 
-POSTMARK_SERVER_TOKEN = os.environ["POSTMARK_SERVER_TOKEN"]
+GMAIL_CLIENT_ID = os.environ["GMAIL_CLIENT_ID"]
+GMAIL_CLIENT_SECRET = os.environ["GMAIL_CLIENT_SECRET"]
+GMAIL_REFRESH_TOKEN = os.environ["GMAIL_REFRESH_TOKEN"]
 
 EMAIL_FROM = os.environ["EMAIL_FROM"]
 
@@ -28,12 +34,10 @@ EMAIL_FROM_NAME = os.environ.get(
 
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
-POSTMARK_URL = "https://api.postmarkapp.com/email"
 
-MESSAGE_STREAM = os.environ.get(
-    "POSTMARK_MESSAGE_STREAM",
-    "outbound",
-)
+GMAIL_SCOPES = [
+    "https://www.googleapis.com/auth/gmail.send"
+]
 
 
 # ============================================================
@@ -268,7 +272,32 @@ def assert_safe_email(
 
 
 # ============================================================
-# SEND EMAIL WITH POSTMARK
+# GMAIL SERVICE
+# ============================================================
+
+def _get_gmail_service():
+
+    credentials = Credentials(
+        token=None,
+        refresh_token=GMAIL_REFRESH_TOKEN,
+        token_uri="https://oauth2.googleapis.com/token",
+        client_id=GMAIL_CLIENT_ID,
+        client_secret=GMAIL_CLIENT_SECRET,
+        scopes=GMAIL_SCOPES,
+    )
+
+    service = build(
+        "gmail",
+        "v1",
+        credentials=credentials,
+        cache_discovery=False,
+    )
+
+    return service
+
+
+# ============================================================
+# SEND EMAIL WITH GMAIL API
 # ============================================================
 
 async def send_email(
@@ -284,59 +313,55 @@ async def send_email(
         html,
     )
 
-    from_address = (
-        f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
-    )
-
-    payload = {
-        "From": from_address,
-        "To": to,
-        "Subject": subject,
-        "HtmlBody": html,
-        "MessageStream": MESSAGE_STREAM,
-    }
-
     final_reply_to = (
         reply_to
         or EMAIL_REPLY_TO
     )
 
-    if final_reply_to:
-
-        payload["ReplyTo"] = final_reply_to
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "X-Postmark-Server-Token": POSTMARK_SERVER_TOKEN,
-    }
-
     try:
 
-        response = requests.post(
-            POSTMARK_URL,
-            headers=headers,
-            json=payload,
-            timeout=30,
+        message = MIMEMultipart("alternative")
+
+        message["To"] = to
+        message["From"] = (
+            f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
+        )
+        message["Subject"] = subject
+
+        if final_reply_to:
+            message["Reply-To"] = final_reply_to
+
+        html_part = MIMEText(
+            html,
+            "html",
+            "utf-8",
         )
 
-        if not response.ok:
+        message.attach(html_part)
 
-            logger.error(
-                "Postmark email failed for %s: %s %s",
-                to,
-                response.status_code,
-                response.text,
+        raw_message = base64.urlsafe_b64encode(
+            message.as_bytes()
+        ).decode()
+
+        gmail_service = _get_gmail_service()
+
+        result = (
+            gmail_service
+            .users()
+            .messages()
+            .send(
+                userId="me",
+                body={
+                    "raw": raw_message
+                },
             )
+            .execute()
+        )
 
-            response.raise_for_status()
-
-        data = response.json()
-
-        message_id = data.get("MessageID")
+        message_id = result.get("id")
 
         logger.info(
-            "Email sent successfully to %s via Postmark "
+            "Email sent successfully to %s via Gmail API "
             "(MessageID=%s)",
             to,
             message_id,
@@ -347,7 +372,7 @@ async def send_email(
     except Exception:
 
         logger.exception(
-            "Postmark API send failed for %s",
+            "Gmail API send failed for %s",
             to,
         )
 
