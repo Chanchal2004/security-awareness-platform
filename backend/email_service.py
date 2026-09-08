@@ -13,20 +13,19 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# MailerSend configuration
+# Resend configuration
 # ============================================================
 
-MAILERSEND_API_TOKEN = os.environ["MAILERSEND_API_TOKEN"]
+RESEND_API_KEY = os.environ["RESEND_API_KEY"]
 
-# IMPORTANT:
-# This MUST be an email address belonging to a VERIFIED
-# MailerSend sending domain.
+# This MUST be an email address belonging to a
+# VERIFIED domain in Resend.
 #
 # Example:
-# EMAIL_FROM=security@test-xkjn41modd64z781.mlsender.net
+# EMAIL_FROM=security@yourdomain.com
 #
-# DO NOT use your Gmail address here unless that domain
-# is actually verified by MailerSend.
+# Do NOT use an arbitrary Gmail address unless
+# Resend has explicitly verified it as a sender.
 EMAIL_FROM = os.environ["EMAIL_FROM"]
 
 # Display name shown to the recipient.
@@ -43,11 +42,11 @@ EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 # Safe API-key diagnostic
 # ============================================================
 
-# NEVER print the complete API token.
+# NEVER print the complete API key.
 logger.info(
-    "MailerSend configuration loaded: token_prefix=%s token_length=%d from=%s",
-    MAILERSEND_API_TOKEN[:8],
-    len(MAILERSEND_API_TOKEN),
+    "Resend configuration loaded: key_prefix=%s key_length=%d from=%s",
+    RESEND_API_KEY[:8],
+    len(RESEND_API_KEY),
     EMAIL_FROM,
 )
 
@@ -66,6 +65,7 @@ _SHORTENERS = (
     "rebrand.ly",
 )
 
+
 _CRED_ASK = (
     "reply with your password",
     "reply with the code",
@@ -82,11 +82,16 @@ _CRED_ASK = (
     "confirm your bank details",
 )
 
+
 _HOSTISH = re.compile(
     r"\b(?:https?://)?((?:[a-z0-9-]+\.)+[a-z]{2,})",
     re.I,
 )
 
+
+# ============================================================
+# URL validation
+# ============================================================
 
 def _host_ok(host: str) -> bool:
     """
@@ -133,6 +138,7 @@ def _same_site(shown: str, real: str) -> bool:
 # ============================================================
 
 class _EmailScan(HTMLParser):
+
     def __init__(self):
         super().__init__()
 
@@ -144,11 +150,13 @@ class _EmailScan(HTMLParser):
         self._text = []
 
     def handle_starttag(self, tag, attrs):
+
         tag_lower = tag.lower()
 
         self.tags.add(tag_lower)
 
         for key, value in attrs:
+
             if (
                 key.lower() in ("href", "src")
                 and value
@@ -156,6 +164,7 @@ class _EmailScan(HTMLParser):
                 self.urls.append(value)
 
         if tag_lower == "a":
+
             attributes = {
                 key.lower(): value
                 for key, value in attrs
@@ -165,14 +174,17 @@ class _EmailScan(HTMLParser):
             self._text = []
 
     def handle_data(self, data):
+
         if self._href is not None:
             self._text.append(data)
 
     def handle_endtag(self, tag):
+
         if (
             tag.lower() == "a"
             and self._href is not None
         ):
+
             self.anchors.append(
                 (
                     self._href,
@@ -207,6 +219,7 @@ def assert_safe_email(
     """
 
     scan = _EmailScan()
+
     scan.feed(html)
 
     # --------------------------------------------------------
@@ -221,6 +234,7 @@ def assert_safe_email(
     }
 
     if scan.tags & forbidden_tags:
+
         raise ValueError(
             "Email templates may not contain forms "
             "or input fields."
@@ -237,6 +251,7 @@ def assert_safe_email(
     for phrase in _CRED_ASK:
 
         if phrase in body:
+
             raise ValueError(
                 "Email may not ask recipients for "
                 "passwords or credentials."
@@ -272,6 +287,7 @@ def assert_safe_email(
                 "http://127.0.0.1:",
             )
         ):
+
             raise ValueError(
                 "All email links and images must be "
                 "absolute https URLs."
@@ -290,6 +306,7 @@ def assert_safe_email(
             or parsed.username is not None
             or parsed.password is not None
         ):
+
             raise ValueError(
                 "Shortened, numeric-host or "
                 "credential-bearing URLs are not allowed."
@@ -319,6 +336,7 @@ def assert_safe_email(
                 shown,
                 real,
             ):
+
                 raise ValueError(
                     "Link text must not reference a "
                     "different website than the link target."
@@ -326,7 +344,7 @@ def assert_safe_email(
 
 
 # ============================================================
-# Send email using MailerSend API
+# Send email using Resend API
 # ============================================================
 
 async def send_email(
@@ -337,11 +355,11 @@ async def send_email(
     reply_to: str | None = None,
 ) -> str | None:
     """
-    Send an authorized email through MailerSend API.
+    Send an authorized email through Resend API.
 
     EMAIL_FROM
         Actual sender email address belonging to a
-        verified MailerSend domain.
+        verified Resend domain.
 
     EMAIL_FROM_NAME
         Display name shown to recipient.
@@ -360,19 +378,12 @@ async def send_email(
     )
 
     # --------------------------------------------------------
-    # MailerSend API payload
+    # Resend API payload
     # --------------------------------------------------------
 
     payload = {
-        "from": {
-            "email": EMAIL_FROM,
-            "name": EMAIL_FROM_NAME,
-        },
-        "to": [
-            {
-                "email": to,
-            }
-        ],
+        "from": f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>",
+        "to": [to],
         "subject": subject,
         "html": html,
     }
@@ -387,43 +398,40 @@ async def send_email(
     )
 
     if final_reply_to:
-        payload["reply_to"] = [
-            {
-                "email": final_reply_to,
-            }
-        ]
+
+        payload["reply_to"] = final_reply_to
 
     # --------------------------------------------------------
-    # MailerSend API headers
+    # Resend API headers
     # --------------------------------------------------------
 
     headers = {
-        "Authorization": f"Bearer {MAILERSEND_API_TOKEN}",
+        "Authorization": f"Bearer {RESEND_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
 
     # --------------------------------------------------------
-    # MailerSend API request
+    # Resend API request
     # --------------------------------------------------------
 
     try:
 
         response = requests.post(
-            "https://api.mailersend.com/v1/email",
+            "https://api.resend.com/emails",
             headers=headers,
             json=payload,
             timeout=30,
         )
 
         # ----------------------------------------------------
-        # Check MailerSend response
+        # Check Resend response
         # ----------------------------------------------------
 
         if not response.ok:
 
             logger.error(
-                "MailerSend email failed for %s: %s %s",
+                "Resend email failed for %s: %s %s",
                 to,
                 response.status_code,
                 response.text,
@@ -432,16 +440,15 @@ async def send_email(
             response.raise_for_status()
 
         # ----------------------------------------------------
-        # MailerSend normally returns 202 Accepted.
-        # The response may not contain JSON/messageId.
+        # Resend returns JSON containing id
         # ----------------------------------------------------
 
-        message_id = response.headers.get(
-            "x-message-id"
-        )
+        data = response.json()
+
+        message_id = data.get("id")
 
         logger.info(
-            "Email sent successfully to %s via MailerSend",
+            "Email sent successfully to %s via Resend",
             to,
         )
 
@@ -450,7 +457,7 @@ async def send_email(
     except Exception:
 
         logger.exception(
-            "MailerSend API send failed for %s",
+            "Resend API send failed for %s",
             to,
         )
 
