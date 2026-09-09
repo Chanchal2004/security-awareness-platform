@@ -33,6 +33,12 @@ FRONTEND_URL = os.environ.get(
     "FRONTEND_URL",
     "https://security-awareness-platform-vtor.vercel.app"
 )
+
+PUBLIC_BASE_URL = os.environ.get(
+    "PUBLIC_BASE_URL",
+    "https://security-awareness-platform-2.onrender.com"
+)
+
 APP_NAME = "TALBROS Security Awareness Center"
 
 
