@@ -1126,7 +1126,6 @@ async def track_open(token: str):
     return FastResponse(content=PIXEL, media_type="image/png",
                         headers={"Cache-Control": "no-store, no-cache, must-revalidate"})
 
-
 @api.get("/track/click/{token}")
 async def track_click(token: str):
     sr = await db.simulation_recipients.find_one({"token": token}, {"_id": 0})
@@ -1143,9 +1142,9 @@ async def track_click(token: str):
         await apply_event(sr, sr["simulation_id"], "LINK_CLICKED")
 
     if sim and sim.get("landing_page_id") and sim["tracking"].get("landing"):
-    return RedirectResponse(
-        url=f"{FRONTEND_URL}/lp/{token}"
-    )
+        return RedirectResponse(
+            url=f"{FRONTEND_URL}/lp/{token}"
+        )
 
     dest = (sim.get("destination_url") if sim else "") or PUBLIC_BASE_URL or "/"
     return RedirectResponse(url=dest)
