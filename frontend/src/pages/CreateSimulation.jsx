@@ -32,7 +32,7 @@ export default function CreateSimulation() {
   const [senderId, setSenderId] = useState("");
   const [subject, setSubject] = useState("");
   const [body, setBody] = useState("<p>Compose your awareness email…</p>");
-  const [destUrl, setDestUrl] = useState("https://security-awareness-platform-2.onrender.com/awareness");
+  const [destUrl, setDestUrl] = useState("https://security-awareness-platform-vtor.vercel.app/awareness");
   const [tracking, setTracking] = useState({ open: true, click: true, landing: true, form: true, form_submit: true });
   const [simEnabled, setSimEnabled] = useState(false);
   const [simFrom, setSimFrom] = useState("");
