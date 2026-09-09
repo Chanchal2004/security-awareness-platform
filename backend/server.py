@@ -1,6 +1,5 @@
 from dotenv import load_dotenv
 from pathlib import Path
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
@@ -30,7 +29,10 @@ from email_service import send_email, assert_safe_email, EMAIL_FROM_NAME
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("talbros")
 
-PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+FRONTEND_URL = os.environ.get(
+    "FRONTEND_URL",
+    "https://security-awareness-platform-vtor.vercel.app"
+)
 APP_NAME = "TALBROS Security Awareness Center"
 
 
@@ -1136,7 +1138,7 @@ async def track_click(token: str):
 
     if sim and sim.get("landing_page_id") and sim["tracking"].get("landing"):
         return RedirectResponse(
-            url=f"{PUBLIC_BASE_URL}/api/public/landing/{token}"
+            url=f"{FRONTEND_URL}/awareness?token={token}"
         )
 
     dest = (sim.get("destination_url") if sim else "") or PUBLIC_BASE_URL or "/"
