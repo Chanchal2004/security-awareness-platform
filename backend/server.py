@@ -1143,9 +1143,9 @@ async def track_click(token: str):
         await apply_event(sr, sr["simulation_id"], "LINK_CLICKED")
 
     if sim and sim.get("landing_page_id") and sim["tracking"].get("landing"):
-        return RedirectResponse(
-            url=f"{FRONTEND_URL}/awareness?token={token}"
-        )
+    return RedirectResponse(
+        url=f"{FRONTEND_URL}/lp/{token}"
+    )
 
     dest = (sim.get("destination_url") if sim else "") or PUBLIC_BASE_URL or "/"
     return RedirectResponse(url=dest)
