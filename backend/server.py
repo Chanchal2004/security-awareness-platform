@@ -6,6 +6,7 @@ load_dotenv(ROOT_DIR / ".env")
 import os
 import re
 import io
+import asyncio
 import csv
 import uuid
 import secrets
@@ -16,6 +17,8 @@ from typing import List, Optional, Dict, Any
 import httpx
 from fastapi import FastAPI, APIRouter, Request, Response, HTTPException, Depends, Query
 from fastapi.responses import RedirectResponse, StreamingResponse, Response as FastResponse
+from motor.motor_asyncio import AsyncIOMotorGridFSBucket
+from bson import ObjectId
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
@@ -24,7 +27,13 @@ from security import (
     hash_password, verify_password, create_access_token, create_refresh_token,
     get_current_user, require_admin,
 )
-from email_service import send_email, assert_safe_email, EMAIL_FROM_NAME
+from email_service import (
+    send_email,
+    assert_safe_email,
+    EMAIL_FROM_NAME,
+    find_incoming_replies,
+    get_incoming_message_details,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("talbros")
@@ -48,6 +57,7 @@ app = FastAPI(title=APP_NAME)
 
 
 api = APIRouter(prefix="/api")
+ATTACHMENTS = AsyncIOMotorGridFSBucket(db, bucket_name="email_attachments")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 URL_RE = re.compile(r"^https?://[^\s]+$", re.I)
 
@@ -401,7 +411,13 @@ async def delete_recipient_activity(
             "form_started": False,
             "form_submitted": False,
             "form_submitted_at": None,
-            "last_activity": None
+            "last_activity": None,
+            "reply_received": False,
+            "reply_text": "",
+            "reply_received_at": None,
+            "attachments": [],
+            "attachment_count": 0,
+            "attachment_names": "",
         }}
     )
 
@@ -986,7 +1002,11 @@ async def send_simulation(sid: str, user: dict = Depends(get_current_user)):
         html = build_email_html(sim, sr)
         if live:
             try:
-                await send_email(to=sr["email"], subject=sim["subject"], html=html)
+                sent_result = await send_email(
+                    to=sr["email"],
+                    subject=sim["subject"],
+                    html=html,
+                )
                 delivery = "SENT"
             except Exception as e:
                 logger.error(f"send failed for {sr['email']}: {e}")
@@ -996,7 +1016,18 @@ async def send_simulation(sid: str, user: dict = Depends(get_current_user)):
         else:
             delivery = "SANDBOX_SENT"
         await db.simulation_recipients.update_one({"id": sr["id"]}, {"$set": {
-            "sent": True, "delivery_status": delivery, "last_activity": ts}})
+            "sent": True,
+            "delivery_status": delivery,
+            "last_activity": ts,
+            "sent_message_id": (sent_result or {}).get("id") if live else None,
+            "thread_id": (sent_result or {}).get("thread_id") if live else None,
+            "reply_received": False,
+            "reply_text": "",
+            "reply_received_at": None,
+            "attachments": [],
+            "attachment_count": 0,
+            "attachment_names": "",
+        }})
         await db.simulation_events.insert_one({
             "id": new_id(), "simulation_id": sid, "recipient_id": sr["id"],
             "recipient_email": sr["email"], "event_type": "EMAIL_SENT", "timestamp": ts})
@@ -1318,6 +1349,304 @@ def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
                              headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
+
+# ---------------------------------------------------------------------------
+# Incoming email replies + GridFS attachments
+# ---------------------------------------------------------------------------
+
+MAX_REPLY_ATTACHMENT_BYTES = 25 * 1024 * 1024
+
+
+def _email_from_header(value: str) -> str:
+    from email.utils import parseaddr
+    return parseaddr(value or "")[1].lower().strip()
+
+
+def _safe_filename(name: str) -> str:
+    name = os.path.basename(name or "attachment")
+    name = re.sub(r"[\x00-\x1f\x7f]", "", name).strip()
+    return name[:240] or "attachment"
+
+
+async def _save_reply_attachment(
+    *,
+    simulation_id: str,
+    recipient_id: str,
+    message_id: str,
+    attachment: dict,
+) -> dict:
+    data = attachment.get("data") or b""
+    if len(data) > MAX_REPLY_ATTACHMENT_BYTES:
+        raise ValueError(
+            f"Attachment {attachment.get('filename', 'attachment')} exceeds the 25 MB limit."
+        )
+
+    filename = _safe_filename(attachment.get("filename", "attachment"))
+    mime_type = attachment.get("mime_type") or "application/octet-stream"
+
+    file_id = await ATTACHMENTS.upload_from_stream(
+        filename,
+        io.BytesIO(data),
+        metadata={
+            "simulation_id": simulation_id,
+            "recipient_id": recipient_id,
+            "message_id": message_id,
+            "mime_type": mime_type,
+            "uploaded_at": now_iso(),
+        },
+    )
+
+    return {
+        "file_id": str(file_id),
+        "filename": filename,
+        "mime_type": mime_type,
+        "size": len(data),
+        "message_id": message_id,
+    }
+
+
+async def _sync_incoming_replies() -> dict:
+    """
+    Read the authorized Gmail inbox and attach only replies belonging to
+    simulation recipients whose outgoing Gmail thread_id is known.
+    """
+    sent_rows = await db.simulation_recipients.find(
+        {
+            "sent": True,
+            "thread_id": {"$exists": True, "$nin": [None, ""]},
+        },
+        {"_id": 0},
+    ).to_list(50000)
+
+    by_thread = {}
+    for row in sent_rows:
+        thread_id = row.get("thread_id")
+        if thread_id:
+            by_thread.setdefault(thread_id, []).append(row)
+
+    if not by_thread:
+        return {"checked": 0, "matched": 0, "new_replies": 0, "attachments": 0}
+
+    incoming = await find_incoming_replies(max_results=100)
+    matched = 0
+    new_replies = 0
+    attachment_count = 0
+
+    for item in incoming:
+        message_id = item.get("id")
+        thread_id = item.get("thread_id")
+        if not message_id or not thread_id:
+            continue
+
+        candidates = by_thread.get(thread_id, [])
+        if not candidates:
+            continue
+
+        # Ignore messages already imported.
+        if await db.email_replies.find_one({"message_id": message_id}, {"_id": 1}):
+            continue
+
+        details = await get_incoming_message_details(message_id)
+        sender_email = _email_from_header(details.get("from", ""))
+
+        # Only accept a reply from the recipient assigned to that simulation.
+        candidate = next(
+            (
+                row for row in candidates
+                if row.get("email", "").lower().strip() == sender_email
+            ),
+            None,
+        )
+        if not candidate:
+            continue
+
+        matched += 1
+        attachments = []
+        total_size = 0
+
+        for attachment in details.get("attachments", []):
+            size = int(attachment.get("size") or 0)
+            if total_size + size > 50 * 1024 * 1024:
+                logger.warning(
+                    "Skipping remaining attachments for message %s: 50 MB reply limit reached.",
+                    message_id,
+                )
+                break
+
+            try:
+                saved = await _save_reply_attachment(
+                    simulation_id=candidate["simulation_id"],
+                    recipient_id=candidate["id"],
+                    message_id=message_id,
+                    attachment=attachment,
+                )
+                attachments.append(saved)
+                total_size += size
+                attachment_count += 1
+            except Exception:
+                logger.exception(
+                    "Could not save attachment from message %s",
+                    message_id,
+                )
+
+        received_at = details.get("date") or now_iso()
+        reply_doc = {
+            "id": new_id(),
+            "message_id": message_id,
+            "thread_id": thread_id,
+            "simulation_id": candidate["simulation_id"],
+            "recipient_id": candidate["id"],
+            "recipient_email": candidate["email"],
+            "from": sender_email,
+            "subject": details.get("subject", ""),
+            "reply_text": details.get("reply_text", ""),
+            "received_at": received_at,
+            "attachments": attachments,
+            "created_at": now_iso(),
+        }
+
+        await db.email_replies.insert_one(reply_doc)
+
+        # Keep the latest reply summary directly on the simulation recipient
+        # so CSV exports remain simple and dynamic.
+        await db.simulation_recipients.update_one(
+            {"id": candidate["id"]},
+            {
+                "$set": {
+                    "reply_received": True,
+                    "reply_text": details.get("reply_text", ""),
+                    "reply_received_at": received_at,
+                    "attachments": attachments,
+                    "attachment_count": len(attachments),
+                    "attachment_names": ", ".join(
+                        a["filename"] for a in attachments
+                    ),
+                    "last_activity": now_iso(),
+                }
+            },
+        )
+
+        await db.simulation_events.insert_one({
+            "id": new_id(),
+            "simulation_id": candidate["simulation_id"],
+            "recipient_id": candidate["id"],
+            "recipient_email": candidate["email"],
+            "event_type": "EMAIL_REPLY_RECEIVED",
+            "timestamp": received_at,
+        })
+
+        new_replies += 1
+
+    return {
+        "checked": len(incoming),
+        "matched": matched,
+        "new_replies": new_replies,
+        "attachments": attachment_count,
+    }
+
+
+@api.post("/replies/sync")
+async def sync_replies(user: dict = Depends(get_current_user)):
+    try:
+        result = await _sync_incoming_replies()
+    except Exception as exc:
+        logger.exception("Reply sync failed")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not sync Gmail replies: {exc}",
+        )
+    await log_audit(
+        user["email"],
+        "EMAIL_REPLIES_SYNCED",
+        None,
+        str(result),
+    )
+    return result
+
+
+@api.get("/replies")
+async def list_replies(
+    simulation_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    query = {}
+    if simulation_id:
+        query["simulation_id"] = simulation_id
+
+    replies = await db.email_replies.find(
+        query,
+        {"_id": 0},
+    ).sort("received_at", -1).to_list(5000)
+
+    # Never expose GridFS file contents here; only download metadata.
+    for reply in replies:
+        reply["attachments"] = [
+            {
+                "file_id": a.get("file_id"),
+                "filename": a.get("filename"),
+                "mime_type": a.get("mime_type"),
+                "size": a.get("size", 0),
+            }
+            for a in reply.get("attachments", [])
+        ]
+
+    return replies
+
+
+@api.get("/replies/attachments/{file_id}")
+async def download_reply_attachment(
+    file_id: str,
+    user: dict = Depends(get_current_user),
+):
+    try:
+        object_id = ObjectId(file_id)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid attachment id")
+
+    try:
+        stream = await ATTACHMENTS.open_download_stream(object_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="Attachment not found")
+
+    filename = _safe_filename(stream.filename)
+    mime_type = (
+        (stream.metadata or {}).get("mime_type")
+        or "application/octet-stream"
+    )
+
+    async def iterator():
+        while True:
+            chunk = await stream.read(1024 * 1024)
+            if not chunk:
+                break
+            yield chunk
+
+    from urllib.parse import quote
+    disposition = (
+        f"inline; filename=\"{filename}\"; "
+        f"filename*=UTF-8''{quote(filename)}"
+    )
+
+    return StreamingResponse(
+        iterator(),
+        media_type=mime_type,
+        headers={"Content-Disposition": disposition},
+    )
+
+
+async def _reply_sync_loop():
+    # Render is a long-running web service, so keep a lightweight polling loop.
+    # Failures are logged and retried; they do not affect API availability.
+    while True:
+        try:
+            await _sync_incoming_replies()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Background Gmail reply sync failed")
+        await asyncio.sleep(300)
+
+
 @api.get("/reports/recipient")
 async def report_recipient(
     simulation_id: Optional[str] = None,
@@ -1371,6 +1700,11 @@ async def report_recipient(
             "form_submitted": r.get("form_submitted"),
             "submission_time": r.get("form_submitted_at"),
             "last_activity": r.get("last_activity"),
+            "reply_received": r.get("reply_received", False),
+            "reply_text": r.get("reply_text", ""),
+            "reply_received_at": r.get("reply_received_at"),
+            "attachment_count": r.get("attachment_count", 0),
+            "attachment_names": r.get("attachment_names", ""),
             **responses,
         }
 
@@ -1393,6 +1727,11 @@ async def report_recipient(
         "form_submitted",
         "submission_time",
         "last_activity",
+        "reply_received",
+        "reply_text",
+        "reply_received_at",
+        "attachment_count",
+        "attachment_names",
     ]
 
     columns = base_columns + sorted(dynamic_fields)
@@ -1516,6 +1855,11 @@ async def startup():
     await db.recipients.create_index("email", unique=True)
     await db.simulation_recipients.create_index("token", unique=True)
     await db.login_attempts.create_index("identifier")
+    await db.email_replies.create_index("message_id", unique=True)
+    await db.email_replies.create_index("thread_id")
+    await db.email_replies.create_index("recipient_id")
+
+    app.state.reply_sync_task = asyncio.create_task(_reply_sync_loop())
 
     admin_email = os.environ["ADMIN_EMAIL"].lower()
     admin_pw = os.environ["ADMIN_PASSWORD"]
@@ -1557,6 +1901,17 @@ async def startup():
                 {"id": new_id(), "label": "Department", "type": "text", "required": False},
                 {"id": new_id(), "label": "What made this email look suspicious?", "type": "textarea", "required": False},
             ], "created_at": now_iso()})
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    task = getattr(app.state, "reply_sync_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 @app.get("/api/health")
