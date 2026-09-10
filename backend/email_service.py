@@ -25,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 GMAIL_TOKEN_JSON = os.environ.get("GMAIL_TOKEN_JSON")
 
-EMAIL_FROM = os.environ["EMAIL_FROM"]
-
 EMAIL_FROM_NAME = os.environ.get(
     "EMAIL_FROM_NAME",
     "Talbros Security Awareness",
@@ -391,7 +389,7 @@ async def send_email(
     subject: str,
     html: str,
     reply_to: str | None = None,
-) -> str | None:
+) -> dict:
 
     assert_safe_email(
         subject,
@@ -409,14 +407,21 @@ async def send_email(
             "alternative"
         )
 
+        gmail_service = _get_gmail_service()
+
         message["To"] = to
 
-        # Keep the configured sender for now.
-        # The actual authenticated Gmail account can be
-        # checked with get_gmail_account_email().
-        message["From"] = (
-            f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
+        # Always send from the authenticated Gmail account.
+        # No user-editable "From" address is accepted.
+        sender_email = (
+            gmail_service.users()
+            .getProfile(userId="me")
+            .execute()
+            .get("emailAddress")
         )
+        if not sender_email:
+            raise RuntimeError("Could not determine authenticated Gmail sender.")
+        message["From"] = f"{EMAIL_FROM_NAME} <{sender_email}>"
 
         message["Subject"] = subject
 
@@ -441,10 +446,6 @@ async def send_email(
                 message.as_bytes()
             )
             .decode()
-        )
-
-        gmail_service = (
-            _get_gmail_service()
         )
 
         result = (
