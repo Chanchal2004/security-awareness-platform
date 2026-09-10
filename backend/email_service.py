@@ -78,7 +78,6 @@ _HOSTISH = re.compile(
 
 
 def _host_ok(host: str) -> bool:
-
     if not host:
         return False
 
@@ -99,7 +98,6 @@ def _host_ok(host: str) -> bool:
 
 
 def _same_site(shown: str, real: str) -> bool:
-
     return (
         shown == real
         or real.endswith("." + shown)
@@ -110,7 +108,6 @@ def _same_site(shown: str, real: str) -> bool:
 class _EmailScan(HTMLParser):
 
     def __init__(self):
-
         super().__init__()
 
         self.tags = set()
@@ -419,8 +416,12 @@ async def send_email(
             .execute()
             .get("emailAddress")
         )
+
         if not sender_email:
-            raise RuntimeError("Could not determine authenticated Gmail sender.")
+            raise RuntimeError(
+                "Could not determine authenticated Gmail sender."
+            )
+
         message["From"] = f"{EMAIL_FROM_NAME} <{sender_email}>"
 
         message["Subject"] = subject
@@ -472,7 +473,13 @@ async def send_email(
             message_id,
         )
 
-        return message_id
+        # IMPORTANT:
+        # Return both Gmail message ID and thread ID.
+        # Backend uses thread_id to detect employee replies.
+        return {
+            "id": message_id,
+            "thread_id": result.get("threadId"),
+        }
 
     except Exception:
 
