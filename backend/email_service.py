@@ -23,24 +23,6 @@ logger = logging.getLogger(__name__)
 # GMAIL API CONFIG
 # ============================================================
 
-# Render Environment Variable:
-#
-# GMAIL_TOKEN_JSON
-#
-# Value = COMPLETE contents of token.json
-#
-# Example:
-# {
-#   "token": "...",
-#   "refresh_token": "...",
-#   "token_uri": "https://oauth2.googleapis.com/token",
-#   "client_id": "...",
-#   "client_secret": "...",
-#   "scopes": [
-#       "https://www.googleapis.com/auth/gmail.send"
-#   ]
-# }
-
 GMAIL_TOKEN_JSON = os.environ.get("GMAIL_TOKEN_JSON")
 
 EMAIL_FROM = os.environ["EMAIL_FROM"]
@@ -52,8 +34,10 @@ EMAIL_FROM_NAME = os.environ.get(
 
 EMAIL_REPLY_TO = os.environ.get("EMAIL_REPLY_TO")
 
+# SEND + READ INCOMING REPLIES / ATTACHMENTS
 GMAIL_SCOPES = [
-    "https://www.googleapis.com/auth/gmail.send"
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.readonly",
 ]
 
 
@@ -327,8 +311,7 @@ def _get_gmail_service():
         ) from exc
 
     # --------------------------------------------------------
-    # Refresh expired access token using refresh_token
-    # contained inside token.json.
+    # Refresh expired access token
     # --------------------------------------------------------
 
     if (
@@ -373,6 +356,32 @@ def _get_gmail_service():
 
 
 # ============================================================
+# GET AUTHENTICATED GMAIL ACCOUNT
+# ============================================================
+
+async def get_gmail_account_email() -> str:
+
+    gmail_service = _get_gmail_service()
+
+    profile = (
+        gmail_service
+        .users()
+        .getProfile(userId="me")
+        .execute()
+    )
+
+    email_address = profile.get("emailAddress")
+
+    if not email_address:
+
+        raise RuntimeError(
+            "Could not determine authenticated Gmail account."
+        )
+
+    return email_address
+
+
+# ============================================================
 # SEND EMAIL WITH GMAIL API
 # ============================================================
 
@@ -402,6 +411,9 @@ async def send_email(
 
         message["To"] = to
 
+        # Keep the configured sender for now.
+        # The actual authenticated Gmail account can be
+        # checked with get_gmail_account_email().
         message["From"] = (
             f"{EMAIL_FROM_NAME} <{EMAIL_FROM}>"
         )
@@ -469,3 +481,384 @@ async def send_email(
         )
 
         raise
+
+
+# ============================================================
+# FIND INCOMING REPLIES
+# ============================================================
+
+async def find_incoming_replies(
+    *,
+    after_message_id: str | None = None,
+    max_results: int = 50,
+) -> list[dict]:
+
+    gmail_service = _get_gmail_service()
+
+    try:
+
+        result = (
+            gmail_service
+            .users()
+            .messages()
+            .list(
+                userId="me",
+                labelIds=["INBOX"],
+                maxResults=max_results,
+            )
+            .execute()
+        )
+
+        messages = result.get(
+            "messages",
+            []
+        )
+
+        output = []
+
+        for item in messages:
+
+            message_id = item.get("id")
+
+            if not message_id:
+                continue
+
+            # Fetch complete message
+            message = (
+                gmail_service
+                .users()
+                .messages()
+                .get(
+                    userId="me",
+                    id=message_id,
+                    format="full",
+                )
+                .execute()
+            )
+
+            payload = message.get(
+                "payload",
+                {}
+            )
+
+            headers = {
+                h.get("name", "").lower():
+                h.get("value", "")
+                for h in payload.get(
+                    "headers",
+                    []
+                )
+            }
+
+            output.append(
+                {
+                    "id": message_id,
+                    "thread_id": message.get(
+                        "threadId"
+                    ),
+                    "from": headers.get(
+                        "from",
+                        ""
+                    ),
+                    "to": headers.get(
+                        "to",
+                        ""
+                    ),
+                    "subject": headers.get(
+                        "subject",
+                        ""
+                    ),
+                    "date": headers.get(
+                        "date",
+                        ""
+                    ),
+                    "payload": payload,
+                }
+            )
+
+        return output
+
+    except Exception:
+
+        logger.exception(
+            "Failed to read incoming Gmail messages."
+        )
+
+        raise
+
+
+# ============================================================
+# EXTRACT MESSAGE TEXT
+# ============================================================
+
+def _decode_gmail_body(data: str | None) -> str:
+
+    if not data:
+        return ""
+
+    try:
+
+        decoded = base64.urlsafe_b64decode(
+            data + "=" * (
+                -len(data) % 4
+            )
+        )
+
+        return decoded.decode(
+            "utf-8",
+            errors="replace",
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Could not decode Gmail message body."
+        )
+
+        return ""
+
+
+def extract_message_text(
+    payload: dict,
+) -> str:
+
+    plain_text = []
+    html_text = []
+
+    def walk(part: dict):
+
+        mime_type = part.get(
+            "mimeType",
+            ""
+        )
+
+        body = part.get(
+            "body",
+            {}
+        )
+
+        data = body.get(
+            "data"
+        )
+
+        if data:
+
+            decoded = _decode_gmail_body(
+                data
+            )
+
+            if mime_type == "text/plain":
+
+                plain_text.append(
+                    decoded
+                )
+
+            elif mime_type == "text/html":
+
+                html_text.append(
+                    decoded
+                )
+
+        for child in part.get(
+            "parts",
+            []
+        ):
+
+            walk(child)
+
+    walk(payload)
+
+    if plain_text:
+
+        return "\n".join(
+            plain_text
+        ).strip()
+
+    return "\n".join(
+        html_text
+    ).strip()
+
+
+# ============================================================
+# EXTRACT ATTACHMENTS
+# ============================================================
+
+def _collect_attachment_parts(
+    payload: dict,
+) -> list[dict]:
+
+    attachments = []
+
+    def walk(part: dict):
+
+        filename = part.get(
+            "filename"
+        )
+
+        body = part.get(
+            "body",
+            {}
+        )
+
+        attachment_id = body.get(
+            "attachmentId"
+        )
+
+        mime_type = part.get(
+            "mimeType",
+            "application/octet-stream"
+        )
+
+        if filename and attachment_id:
+
+            attachments.append(
+                {
+                    "filename": filename,
+                    "mime_type": mime_type,
+                    "attachment_id": attachment_id,
+                }
+            )
+
+        for child in part.get(
+            "parts",
+            []
+        ):
+
+            walk(child)
+
+    walk(payload)
+
+    return attachments
+
+
+async def get_message_attachments(
+    message_id: str,
+    payload: dict,
+) -> list[dict]:
+
+    gmail_service = _get_gmail_service()
+
+    parts = _collect_attachment_parts(
+        payload
+    )
+
+    results = []
+
+    for part in parts:
+
+        try:
+
+            result = (
+                gmail_service
+                .users()
+                .messages()
+                .attachments()
+                .get(
+                    userId="me",
+                    messageId=message_id,
+                    id=part["attachment_id"],
+                )
+                .execute()
+            )
+
+            encoded_data = result.get(
+                "data",
+                ""
+            )
+
+            file_data = base64.urlsafe_b64decode(
+                encoded_data + "=" * (
+                    -len(encoded_data) % 4
+                )
+            )
+
+            results.append(
+                {
+                    "filename": part["filename"],
+                    "mime_type": part["mime_type"],
+                    "data": file_data,
+                    "size": len(file_data),
+                }
+            )
+
+        except Exception:
+
+            logger.exception(
+                "Failed to download attachment %s "
+                "from Gmail message %s",
+                part["filename"],
+                message_id,
+            )
+
+    return results
+
+
+# ============================================================
+# GET REPLY + ATTACHMENTS TOGETHER
+# ============================================================
+
+async def get_incoming_message_details(
+    message_id: str,
+) -> dict:
+
+    gmail_service = _get_gmail_service()
+
+    message = (
+        gmail_service
+        .users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="full",
+        )
+        .execute()
+    )
+
+    payload = message.get(
+        "payload",
+        {}
+    )
+
+    headers = {
+        h.get("name", "").lower():
+        h.get("value", "")
+        for h in payload.get(
+            "headers",
+            []
+        )
+    }
+
+    reply_text = extract_message_text(
+        payload
+    )
+
+    attachments = await get_message_attachments(
+        message_id,
+        payload,
+    )
+
+    return {
+        "message_id": message_id,
+        "thread_id": message.get(
+            "threadId"
+        ),
+        "from": headers.get(
+            "from",
+            ""
+        ),
+        "to": headers.get(
+            "to",
+            ""
+        ),
+        "subject": headers.get(
+            "subject",
+            ""
+        ),
+        "date": headers.get(
+            "date",
+            ""
+        ),
+        "reply_text": reply_text,
+        "attachments": attachments,
+    }
