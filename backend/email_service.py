@@ -5,6 +5,8 @@ import logging
 import json
 import base64
 
+import msal
+
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 
@@ -37,6 +39,30 @@ GMAIL_SCOPES = [
     "https://www.googleapis.com/auth/gmail.send",
     "https://www.googleapis.com/auth/gmail.readonly",
 ]
+
+
+# ============================================================
+# MICROSOFT GRAPH SEND CONFIG
+# ============================================================
+
+MICROSOFT_CLIENT_ID = os.environ.get("MICROSOFT_CLIENT_ID")
+MICROSOFT_TENANT_ID = os.environ.get("MICROSOFT_TENANT_ID")
+MICROSOFT_AUTHORITY = os.environ.get(
+    "MICROSOFT_AUTHORITY",
+    "https://login.microsoftonline.com/common",
+)
+MICROSOFT_SENDER_EMAIL = os.environ.get(
+    "MICROSOFT_SENDER_EMAIL",
+    "chanchal@qhtalbros.com",
+)
+MICROSOFT_TOKEN_CACHE = os.environ.get("MICROSOFT_TOKEN_CACHE")
+MICROSOFT_SCOPES = ["Mail.Send"]
+
+
+# Keep the MSAL cache in memory for the lifetime of the Render process.
+# The initial serialized cache is supplied through Render Environment Variables.
+_microsoft_token_cache = None
+_microsoft_msal_app = None
 
 
 # ============================================================
@@ -377,7 +403,79 @@ async def get_gmail_account_email() -> str:
 
 
 # ============================================================
-# SEND EMAIL WITH GMAIL API
+# MICROSOFT GRAPH TOKEN / CLIENT
+# ============================================================
+
+def _get_microsoft_msal_app():
+    global _microsoft_token_cache, _microsoft_msal_app
+
+    if _microsoft_msal_app is not None:
+        return _microsoft_msal_app
+
+    if not MICROSOFT_CLIENT_ID:
+        raise RuntimeError(
+            "MICROSOFT_CLIENT_ID is not set in Render Environment Variables."
+        )
+
+    if not MICROSOFT_TOKEN_CACHE:
+        raise RuntimeError(
+            "MICROSOFT_TOKEN_CACHE is not set in Render Environment Variables. "
+            "Put the serialized MSAL token cache here; do not put only an access token."
+        )
+
+    _microsoft_token_cache = msal.SerializableTokenCache()
+
+    try:
+        _microsoft_token_cache.deserialize(MICROSOFT_TOKEN_CACHE)
+    except Exception as exc:
+        raise RuntimeError(
+            f"MICROSOFT_TOKEN_CACHE is not a valid MSAL token cache: {exc}"
+        ) from exc
+
+    _microsoft_msal_app = msal.PublicClientApplication(
+        client_id=MICROSOFT_CLIENT_ID,
+        authority=MICROSOFT_AUTHORITY,
+        token_cache=_microsoft_token_cache,
+    )
+
+    return _microsoft_msal_app
+
+
+def _get_microsoft_access_token() -> str:
+    app = _get_microsoft_msal_app()
+
+    accounts = app.get_accounts(username=MICROSOFT_SENDER_EMAIL)
+    if not accounts:
+        accounts = app.get_accounts()
+
+    if not accounts:
+        raise RuntimeError(
+            "No Microsoft login account was found in MICROSOFT_TOKEN_CACHE. "
+            "Run the local Microsoft login/token-cache generator again and copy the "
+            "complete MSAL cache JSON into Render."
+        )
+
+    result = app.acquire_token_silent(
+        MICROSOFT_SCOPES,
+        account=accounts[0],
+    )
+
+    if not result or "access_token" not in result:
+        error = (result or {}).get("error_description") or (result or {}).get("error")
+        raise RuntimeError(
+            "Microsoft token acquisition failed."
+            + (f" {error}" if error else "")
+        )
+
+    logger.info(
+        "Microsoft Graph access token acquired successfully for %s.",
+        MICROSOFT_SENDER_EMAIL,
+    )
+    return result["access_token"]
+
+
+# ============================================================
+# SEND EMAIL WITH MICROSOFT GRAPH API
 # ============================================================
 
 async def send_email(
@@ -399,95 +497,85 @@ async def send_email(
     )
 
     try:
+        access_token = _get_microsoft_access_token()
 
-        message = MIMEMultipart(
-            "alternative"
-        )
-
-        gmail_service = _get_gmail_service()
-
-        message["To"] = to
-
-        # Always send from the authenticated Gmail account.
-        # No user-editable "From" address is accepted.
-        sender_email = (
-            gmail_service.users()
-            .getProfile(userId="me")
-            .execute()
-            .get("emailAddress")
-        )
-
-        if not sender_email:
-            raise RuntimeError(
-                "Could not determine authenticated Gmail sender."
-            )
-
-        message["From"] = f"{EMAIL_FROM_NAME} <{sender_email}>"
-
-        message["Subject"] = subject
+        message = {
+            "subject": subject,
+            "body": {
+                "contentType": "HTML",
+                "content": html,
+            },
+            "toRecipients": [
+                {
+                    "emailAddress": {
+                        "address": to,
+                    }
+                }
+            ],
+        }
 
         if final_reply_to:
+            message["replyTo"] = [
+                {
+                    "emailAddress": {
+                        "address": final_reply_to,
+                    }
+                }
+            ]
 
-            message["Reply-To"] = (
-                final_reply_to
+        payload = {
+            "message": message,
+            "saveToSentItems": True,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        # Microsoft Graph returns 202 Accepted for a successful send.
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                "https://graph.microsoft.com/v1.0/me/sendMail",
+                headers=headers,
+                json=payload,
             )
 
-        html_part = MIMEText(
-            html,
-            "html",
-            "utf-8",
-        )
+        if response.status_code != 202:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = response.text
 
-        message.attach(
-            html_part
-        )
-
-        raw_message = (
-            base64.urlsafe_b64encode(
-                message.as_bytes()
+            logger.error(
+                "Microsoft Graph send failed for %s: HTTP %s - %s",
+                to,
+                response.status_code,
+                detail,
             )
-            .decode()
-        )
-
-        result = (
-            gmail_service
-            .users()
-            .messages()
-            .send(
-                userId="me",
-                body={
-                    "raw": raw_message
-                },
+            raise RuntimeError(
+                f"Microsoft Graph send failed (HTTP {response.status_code}): {detail}"
             )
-            .execute()
-        )
-
-        message_id = result.get(
-            "id"
-        )
 
         logger.info(
-            "Email sent successfully to %s via Gmail API "
-            "(MessageID=%s)",
+            "Email sent successfully to %s via Microsoft Graph API from %s.",
             to,
-            message_id,
+            MICROSOFT_SENDER_EMAIL,
         )
 
-        # IMPORTANT:
-        # Return both Gmail message ID and thread ID.
-        # Backend uses thread_id to detect employee replies.
+        # Graph sendMail returns 202 and normally does not return the created
+        # message ID in the response body. Keep the same return shape expected
+        # by app.py so the rest of the application does not need to change.
         return {
-            "id": message_id,
-            "thread_id": result.get("threadId"),
+            "id": None,
+            "thread_id": None,
         }
 
     except Exception:
-
         logger.exception(
-            "Gmail API send failed for %s",
+            "Microsoft Graph API send failed for %s",
             to,
         )
-
         raise
 
 
