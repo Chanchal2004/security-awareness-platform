@@ -4,7 +4,7 @@ import ipaddress
 import logging
 import json
 import base64
-
+import httpx
 import msal
 
 from email.mime.text import MIMEText
