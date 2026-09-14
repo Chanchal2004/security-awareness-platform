@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import json
 import base64
+import time
 
 import httpx
 import msal
@@ -17,6 +18,7 @@ from urllib.parse import urlparse
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 
 logger = logging.getLogger(__name__)
@@ -581,106 +583,161 @@ async def send_email(
 
 
 # ============================================================
-# FIND INCOMING REPLIES
+# FIND INCOMING REPLIES (QUOTA-SAFE)
 # ============================================================
+
+
+def _is_gmail_rate_limit_error(exc: Exception) -> bool:
+    if not isinstance(exc, HttpError):
+        return False
+    try:
+        payload = json.loads(exc.content.decode("utf-8", errors="replace"))
+        reasons = {
+            str(item.get("reason", ""))
+            for item in payload.get("error", {}).get("errors", [])
+        }
+        return bool(reasons & {"rateLimitExceeded", "userRateLimitExceeded"})
+    except Exception:
+        return "rateLimitExceeded" in str(exc) or "userRateLimitExceeded" in str(exc)
+
+
+def _execute_gmail(request, *, retries: int = 2):
+    """Execute a Gmail request with small exponential backoff only for rate limits."""
+    delay = 1.0
+    for attempt in range(retries + 1):
+        try:
+            return request.execute()
+        except HttpError as exc:
+            if not _is_gmail_rate_limit_error(exc) or attempt >= retries:
+                raise
+            logger.warning(
+                "Gmail rate limit reached; backing off %.1fs before retry %d/%d.",
+                delay,
+                attempt + 1,
+                retries,
+            )
+            time.sleep(delay)
+            delay *= 2
+
+
+async def get_gmail_history_id() -> str:
+    """Return the current mailbox historyId. getProfile costs only 1 quota unit."""
+    gmail_service = _get_gmail_service()
+    profile = _execute_gmail(
+        gmail_service.users().getProfile(userId="me")
+    )
+    history_id = profile.get("historyId")
+    if not history_id:
+        raise RuntimeError("Gmail did not return a mailbox historyId.")
+    return str(history_id)
+
 
 async def find_incoming_replies(
     *,
-    after_message_id: str | None = None,
+    start_history_id: str | None = None,
     max_results: int = 50,
-) -> list[dict]:
+) -> dict:
+    """
+    Return only new/likely reply messages plus the mailbox historyId to persist.
 
+    Normal operation uses Gmail history.list (2 quota units) instead of repeatedly
+    scanning the inbox and doing a full messages.get for every message. On the
+    first sync, a small recent-inbox scan is used to import already-existing
+    replies, and the current historyId is returned for subsequent incremental syncs.
+    """
     gmail_service = _get_gmail_service()
+    current_history_id = await get_gmail_history_id()
+    message_ids: list[dict] = []
 
     try:
+        if start_history_id:
+            try:
+                page_token = None
+                seen = set()
+                while True:
+                    kwargs = {
+                        "userId": "me",
+                        "startHistoryId": str(start_history_id),
+                        "historyTypes": ["messageAdded"],
+                        "labelId": "INBOX",
+                        "maxResults": min(max_results, 100),
+                    }
+                    if page_token:
+                        kwargs["pageToken"] = page_token
 
-        result = (
-            gmail_service
-            .users()
-            .messages()
-            .list(
-                userId="me",
-                labelIds=["INBOX"],
-                maxResults=max_results,
+                    result = _execute_gmail(
+                        gmail_service.users().history().list(**kwargs)
+                    )
+                    for history in result.get("history", []):
+                        for added in history.get("messagesAdded", []):
+                            msg = added.get("message") or {}
+                            mid = msg.get("id")
+                            if mid and mid not in seen:
+                                seen.add(mid)
+                                message_ids.append({
+                                    "id": mid,
+                                    "threadId": msg.get("threadId"),
+                                })
+                    page_token = result.get("nextPageToken")
+                    if not page_token:
+                        break
+            except HttpError as exc:
+                # Gmail history IDs normally remain valid for at least a week,
+                # but Google documents that they can occasionally expire sooner.
+                if getattr(exc, "status_code", None) == 404 or getattr(exc.resp, "status", None) == 404:
+                    logger.warning("Gmail historyId expired; performing a small recent-message fallback sync.")
+                    start_history_id = None
+                else:
+                    raise
+
+        if not start_history_id:
+            result = _execute_gmail(
+                gmail_service.users().messages().list(
+                    userId="me",
+                    labelIds=["INBOX"],
+                    q="newer_than:14d",
+                    maxResults=min(max_results, 50),
+                )
             )
-            .execute()
-        )
-
-        messages = result.get(
-            "messages",
-            []
-        )
+            message_ids = result.get("messages", [])
 
         output = []
-
-        for item in messages:
-
+        for item in message_ids[: max(1, min(max_results, 50))]:
             message_id = item.get("id")
-
             if not message_id:
                 continue
 
-            # Fetch complete message
-            message = (
-                gmail_service
-                .users()
-                .messages()
-                .get(
+            # Metadata is enough for matching. A full message is fetched only
+            # after the server has identified a candidate reply.
+            message = _execute_gmail(
+                gmail_service.users().messages().get(
                     userId="me",
                     id=message_id,
-                    format="full",
+                    format="metadata",
+                    metadataHeaders=["From", "To", "Subject", "Date"],
                 )
-                .execute()
             )
-
-            payload = message.get(
-                "payload",
-                {}
-            )
-
             headers = {
-                h.get("name", "").lower():
-                h.get("value", "")
-                for h in payload.get(
-                    "headers",
-                    []
-                )
+                h.get("name", "").lower(): h.get("value", "")
+                for h in (message.get("payload", {}) or {}).get("headers", [])
             }
+            output.append({
+                "id": message_id,
+                "thread_id": message.get("threadId"),
+                "from": headers.get("from", ""),
+                "to": headers.get("to", ""),
+                "subject": headers.get("subject", ""),
+                "date": headers.get("date", ""),
+            })
 
-            output.append(
-                {
-                    "id": message_id,
-                    "thread_id": message.get(
-                        "threadId"
-                    ),
-                    "from": headers.get(
-                        "from",
-                        ""
-                    ),
-                    "to": headers.get(
-                        "to",
-                        ""
-                    ),
-                    "subject": headers.get(
-                        "subject",
-                        ""
-                    ),
-                    "date": headers.get(
-                        "date",
-                        ""
-                    ),
-                    "payload": payload,
-                }
-            )
-
-        return output
+        return {
+            "messages": output,
+            "history_id": current_history_id,
+            "used_history": bool(start_history_id),
+        }
 
     except Exception:
-
-        logger.exception(
-            "Failed to read incoming Gmail messages."
-        )
-
+        logger.exception("Failed to read incoming Gmail messages.")
         raise
 
 
@@ -783,48 +840,27 @@ def extract_message_text(
 def _collect_attachment_parts(
     payload: dict,
 ) -> list[dict]:
-
     attachments = []
 
     def walk(part: dict):
+        filename = part.get("filename")
+        body = part.get("body") or {}
+        attachment_id = body.get("attachmentId")
+        inline_data = body.get("data")
+        mime_type = part.get("mimeType", "application/octet-stream")
 
-        filename = part.get(
-            "filename"
-        )
+        if filename and (attachment_id or inline_data):
+            attachments.append({
+                "filename": filename,
+                "mime_type": mime_type,
+                "attachment_id": attachment_id,
+                "inline_data": inline_data,
+            })
 
-        body = part.get(
-            "body",
-            {}
-        )
-
-        attachment_id = body.get(
-            "attachmentId"
-        )
-
-        mime_type = part.get(
-            "mimeType",
-            "application/octet-stream"
-        )
-
-        if filename and attachment_id:
-
-            attachments.append(
-                {
-                    "filename": filename,
-                    "mime_type": mime_type,
-                    "attachment_id": attachment_id,
-                }
-            )
-
-        for child in part.get(
-            "parts",
-            []
-        ):
-
+        for child in part.get("parts", []) or []:
             walk(child)
 
     walk(payload)
-
     return attachments
 
 
@@ -832,58 +868,37 @@ async def get_message_attachments(
     message_id: str,
     payload: dict,
 ) -> list[dict]:
-
     gmail_service = _get_gmail_service()
-
-    parts = _collect_attachment_parts(
-        payload
-    )
-
+    parts = _collect_attachment_parts(payload)
     results = []
 
     for part in parts:
-
         try:
-
-            result = (
-                gmail_service
-                .users()
-                .messages()
-                .attachments()
-                .get(
-                    userId="me",
-                    messageId=message_id,
-                    id=part["attachment_id"],
+            if part.get("inline_data"):
+                encoded_data = part["inline_data"]
+            else:
+                result = _execute_gmail(
+                    gmail_service.users().messages().attachments().get(
+                        userId="me",
+                        messageId=message_id,
+                        id=part["attachment_id"],
+                    )
                 )
-                .execute()
-            )
-
-            encoded_data = result.get(
-                "data",
-                ""
-            )
+                encoded_data = result.get("data", "")
 
             file_data = base64.urlsafe_b64decode(
-                encoded_data + "=" * (
-                    -len(encoded_data) % 4
-                )
+                encoded_data + "=" * (-len(encoded_data) % 4)
             )
-
-            results.append(
-                {
-                    "filename": part["filename"],
-                    "mime_type": part["mime_type"],
-                    "data": file_data,
-                    "size": len(file_data),
-                }
-            )
-
+            results.append({
+                "filename": part["filename"],
+                "mime_type": part["mime_type"],
+                "data": file_data,
+                "size": len(file_data),
+            })
         except Exception:
-
             logger.exception(
-                "Failed to download attachment %s "
-                "from Gmail message %s",
-                part["filename"],
+                "Failed to download attachment %s from Gmail message %s",
+                part.get("filename", "attachment"),
                 message_id,
             )
 
@@ -900,16 +915,12 @@ async def get_incoming_message_details(
 
     gmail_service = _get_gmail_service()
 
-    message = (
-        gmail_service
-        .users()
-        .messages()
-        .get(
+    message = _execute_gmail(
+        gmail_service.users().messages().get(
             userId="me",
             id=message_id,
             format="full",
         )
-        .execute()
     )
 
     payload = message.get(
