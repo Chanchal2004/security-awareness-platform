@@ -1357,6 +1357,9 @@ def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 # ---------------------------------------------------------------------------
 
 MAX_REPLY_ATTACHMENT_BYTES = 25 * 1024 * 1024
+REPLY_SYNC_INTERVAL_SECONDS = 60
+REPLY_SYNC_LOCK = asyncio.Lock()
+_last_reply_sync_at = 0.0
 
 
 def _email_from_header(value: str) -> str:
@@ -1436,194 +1439,205 @@ def _clean_reply_text(value: str) -> str:
 
 
 def _normalize_subject(value: str) -> str:
-    """Normalize common reply/forward prefixes added by mail clients."""
-    value = html_lib.unescape(value or "").strip().lower()
-    # Remove common external-mail/security prefixes.
-    value = re.sub(r"\[external[^\]]*\]", " ", value, flags=re.I)
-    value = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", value, flags=re.I)
-    # Some clients stack prefixes: Re: Re: Subject.
-    while re.match(r"^\s*(?:re|fw|fwd)\s*:\s*", value, flags=re.I):
-        value = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", value, count=1, flags=re.I)
-    value = re.sub(r"\s+", " ", value).strip(" -")
+    value = (value or "").strip().lower()
+    while value.startswith("re:"):
+        value = value[3:].strip()
     return value
 
 
-async def _sync_incoming_replies() -> dict:
-    """
-    Read the authorized Gmail inbox and associate replies with the correct
-    simulation recipient. Gmail thread_id is preferred; Microsoft Graph-sent
-    messages do not expose a Gmail thread_id, so sender + subject + most recent
-    matching sent recipient are used as a fallback.
-    """
-    sent_rows = await db.simulation_recipients.find(
-        {"sent": True},
-        {"_id": 0},
-    ).to_list(50000)
+async def _sync_incoming_replies(*, force: bool = False) -> dict:
+    """Incrementally sync Gmail replies without repeatedly scanning the inbox."""
+    global _last_reply_sync_at
 
-    by_thread = {}
-    for row in sent_rows:
-        thread_id = row.get("thread_id")
-        if thread_id:
-            by_thread.setdefault(thread_id, []).append(row)
-
-    if not sent_rows:
-        return {"checked": 0, "matched": 0, "new_replies": 0, "attachments": 0}
-
-    incoming = await find_incoming_replies(max_results=100)
-    matched = 0
-    new_replies = 0
-    attachment_count = 0
-
-    for item in incoming:
-        message_id = item.get("id")
-        thread_id = item.get("thread_id")
-        if not message_id:
-            continue
-
-        candidates = by_thread.get(thread_id, []) if thread_id else []
-
-        # Ignore messages already imported.
-        if await db.email_replies.find_one({"message_id": message_id}, {"_id": 1}):
-            continue
-
-        details = await get_incoming_message_details(message_id)
-        sender_email = _email_from_header(details.get("from", ""))
-        incoming_subject = _normalize_subject(details.get("subject", ""))
-
-        # Prefer the Gmail thread match. If Graph sent the original message,
-        # there is no Gmail thread_id, so fall back to recipient + subject and
-        # select the most recently sent matching simulation.
-        candidate = next(
-            (
-                row for row in candidates
-                if row.get("email", "").lower().strip() == sender_email
-            ),
-            None,
-        )
-
-        if not candidate:
-            sender_rows = [
-                row for row in sent_rows
-                if row.get("email", "").lower().strip() == sender_email
-            ]
-
-            # First match the normalized subject. If the same recipient received
-            # multiple simulations with the same subject, the latest sent row is
-            # the best deterministic match.
-            fallback = [
-                row for row in sender_rows
-                if _normalize_subject(row.get("subject", "")) == incoming_subject
-            ]
-            fallback.sort(key=lambda row: row.get("last_activity") or "", reverse=True)
-
-            if fallback:
-                candidate = fallback[0]
-            elif len(sender_rows) == 1:
-                # Safe sender-only fallback when there is only one possible row.
-                candidate = sender_rows[0]
-            elif sender_rows:
-                # Graph-sent messages do not provide Gmail thread IDs. When the
-                # mail client changes the subject, associate the reply with the
-                # most recently sent simulation for that recipient. This is what
-                # makes repeated tests to the same Gmail address work reliably.
-                sender_rows.sort(
-                    key=lambda row: row.get("last_activity") or "",
-                    reverse=True,
-                )
-                candidate = sender_rows[0]
-
-        if not candidate:
-            continue
-
-        matched += 1
-        attachments = []
-        total_size = 0
-
-        for attachment in details.get("attachments", []):
-            size = int(attachment.get("size") or 0)
-            if total_size + size > 50 * 1024 * 1024:
-                logger.warning(
-                    "Skipping remaining attachments for message %s: 50 MB reply limit reached.",
-                    message_id,
-                )
-                break
-
-            try:
-                saved = await _save_reply_attachment(
-                    simulation_id=candidate["simulation_id"],
-                    recipient_id=candidate["id"],
-                    message_id=message_id,
-                    attachment=attachment,
-                )
-                attachments.append(saved)
-                total_size += size
-                attachment_count += 1
-            except Exception:
-                logger.exception(
-                    "Could not save attachment from message %s",
-                    message_id,
-                )
-
-        received_at = details.get("date") or now_iso()
-        reply_doc = {
-            "id": new_id(),
-            "message_id": message_id,
-            "thread_id": thread_id,
-            "simulation_id": candidate["simulation_id"],
-            "recipient_id": candidate["id"],
-            "recipient_email": candidate["email"],
-            "from": sender_email,
-            "subject": details.get("subject", ""),
-            "reply_text": _clean_reply_text(details.get("reply_text", "")),
-            "received_at": received_at,
-            "attachments": attachments,
-            "created_at": now_iso(),
+    now = asyncio.get_running_loop().time()
+    if not force and now - _last_reply_sync_at < REPLY_SYNC_INTERVAL_SECONDS:
+        return {
+            "checked": 0,
+            "matched": 0,
+            "new_replies": 0,
+            "attachments": 0,
+            "skipped": "cooldown",
         }
 
-        await db.email_replies.insert_one(reply_doc)
+    async with REPLY_SYNC_LOCK:
+        now = asyncio.get_running_loop().time()
+        if not force and now - _last_reply_sync_at < REPLY_SYNC_INTERVAL_SECONDS:
+            return {
+                "checked": 0,
+                "matched": 0,
+                "new_replies": 0,
+                "attachments": 0,
+                "skipped": "cooldown",
+            }
 
-        # Keep the latest reply summary directly on the simulation recipient
-        # so CSV exports remain simple and dynamic.
-        await db.simulation_recipients.update_one(
-            {"id": candidate["id"]},
-            {
-                "$set": {
+        _last_reply_sync_at = now
+
+        sent_rows = await db.simulation_recipients.find(
+            {"sent": True}, {"_id": 0}
+        ).to_list(50000)
+        if not sent_rows:
+            return {"checked": 0, "matched": 0, "new_replies": 0, "attachments": 0}
+
+        state = await db.gmail_sync_state.find_one(
+            {"id": "incoming_replies"}, {"_id": 0}
+        )
+        start_history_id = state.get("history_id") if state else None
+
+        try:
+            scan = await find_incoming_replies(
+                start_history_id=start_history_id,
+                max_results=50,
+            )
+        except Exception as exc:
+            # Do not turn a temporary Gmail quota/rate-limit condition into a
+            # broken reports page. The next scheduled/manual sync can retry.
+            text = str(exc)
+            if "rateLimitExceeded" in text or "userRateLimitExceeded" in text or "429" in text:
+                return {
+                    "checked": 0,
+                    "matched": 0,
+                    "new_replies": 0,
+                    "attachments": 0,
+                    "rate_limited": True,
+                    "retry_after": 60,
+                }
+            raise
+
+        incoming = scan.get("messages", [])
+        history_id = scan.get("history_id")
+        if history_id:
+            await db.gmail_sync_state.update_one(
+                {"id": "incoming_replies"},
+                {"$set": {"id": "incoming_replies", "history_id": str(history_id), "updated_at": now_iso()}},
+                upsert=True,
+            )
+
+        by_thread = {}
+        for row in sent_rows:
+            thread_id = row.get("thread_id")
+            if thread_id:
+                by_thread.setdefault(thread_id, []).append(row)
+
+        sent_by_sender = {}
+        for row in sent_rows:
+            sent_by_sender.setdefault(row.get("email", "").lower().strip(), []).append(row)
+
+        matched = 0
+        new_replies = 0
+        attachment_count = 0
+
+        for item in incoming:
+            message_id = item.get("id")
+            thread_id = item.get("thread_id")
+            if not message_id:
+                continue
+            if await db.email_replies.find_one({"message_id": message_id}, {"_id": 1}):
+                continue
+
+            sender_email = _email_from_header(item.get("from", ""))
+            incoming_subject = _normalize_subject(item.get("subject", ""))
+            candidates = by_thread.get(thread_id, []) if thread_id else []
+            candidate = next(
+                (row for row in candidates if row.get("email", "").lower().strip() == sender_email),
+                None,
+            )
+
+            if not candidate:
+                fallback = [
+                    row for row in sent_by_sender.get(sender_email, [])
+                    if _normalize_subject(row.get("subject", "")) == incoming_subject
+                ]
+                if not fallback:
+                    sender_rows = sent_by_sender.get(sender_email, [])
+                    fallback = sender_rows if len(sender_rows) == 1 else []
+                fallback.sort(key=lambda row: row.get("last_activity") or "", reverse=True)
+                candidate = fallback[0] if fallback else None
+
+            if not candidate:
+                continue
+
+            matched += 1
+            details = await get_incoming_message_details(message_id)
+            attachments = []
+            total_size = 0
+            for attachment in details.get("attachments", []):
+                size = int(attachment.get("size") or 0)
+                if total_size + size > 50 * 1024 * 1024:
+                    logger.warning("Skipping remaining attachments for message %s: 50 MB reply limit reached.", message_id)
+                    break
+                try:
+                    saved = await _save_reply_attachment(
+                        simulation_id=candidate["simulation_id"],
+                        recipient_id=candidate["id"],
+                        message_id=message_id,
+                        attachment=attachment,
+                    )
+                    attachments.append(saved)
+                    total_size += size
+                    attachment_count += 1
+                except Exception:
+                    logger.exception("Could not save attachment from message %s", message_id)
+
+            received_at = details.get("date") or now_iso()
+            clean_text = _clean_reply_text(details.get("reply_text", ""))
+            reply_doc = {
+                "id": new_id(),
+                "message_id": message_id,
+                "thread_id": thread_id,
+                "simulation_id": candidate["simulation_id"],
+                "recipient_id": candidate["id"],
+                "recipient_email": candidate["email"],
+                "from": sender_email,
+                "subject": details.get("subject", ""),
+                "reply_text": clean_text,
+                "received_at": received_at,
+                "attachments": attachments,
+                "created_at": now_iso(),
+            }
+            await db.email_replies.update_one(
+                {"message_id": message_id}, {"$setOnInsert": reply_doc}, upsert=True
+            )
+
+            await db.simulation_recipients.update_one(
+                {"id": candidate["id"]},
+                {"$set": {
                     "reply_received": True,
-                    "reply_text": _clean_reply_text(details.get("reply_text", "")),
+                    "reply_text": clean_text,
                     "reply_received_at": received_at,
                     "attachments": attachments,
                     "attachment_count": len(attachments),
-                    "attachment_names": ", ".join(
-                        a["filename"] for a in attachments
-                    ),
+                    "attachment_names": ", ".join(a["filename"] for a in attachments),
                     "last_activity": now_iso(),
-                }
-            },
-        )
+                }}
+            )
+            await db.simulation_events.update_one(
+                {"simulation_id": candidate["simulation_id"], "recipient_id": candidate["id"], "event_type": "EMAIL_REPLY_RECEIVED", "message_id": message_id},
+                {"$setOnInsert": {
+                    "id": new_id(),
+                    "simulation_id": candidate["simulation_id"],
+                    "recipient_id": candidate["id"],
+                    "recipient_email": candidate["email"],
+                    "event_type": "EMAIL_REPLY_RECEIVED",
+                    "message_id": message_id,
+                    "timestamp": received_at,
+                }},
+                upsert=True,
+            )
+            new_replies += 1
 
-        await db.simulation_events.insert_one({
-            "id": new_id(),
-            "simulation_id": candidate["simulation_id"],
-            "recipient_id": candidate["id"],
-            "recipient_email": candidate["email"],
-            "event_type": "EMAIL_REPLY_RECEIVED",
-            "timestamp": received_at,
-        })
-
-        new_replies += 1
-
-    return {
-        "checked": len(incoming),
-        "matched": matched,
-        "new_replies": new_replies,
-        "attachments": attachment_count,
-    }
+        return {
+            "checked": len(incoming),
+            "matched": matched,
+            "new_replies": new_replies,
+            "attachments": attachment_count,
+            "rate_limited": False,
+        }
 
 
 @api.post("/replies/sync")
 async def sync_replies(user: dict = Depends(get_current_user)):
     try:
-        result = await _sync_incoming_replies()
+        result = await _sync_incoming_replies(force=False)
     except Exception as exc:
         logger.exception("Reply sync failed")
         raise HTTPException(
@@ -1714,12 +1728,12 @@ async def _reply_sync_loop():
     # Failures are logged and retried; they do not affect API availability.
     while True:
         try:
-            await _sync_incoming_replies()
+            await _sync_incoming_replies(force=False)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("Background Gmail reply sync failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(900)
 
 
 @api.get("/reports/recipient-data")
@@ -1820,26 +1834,6 @@ async def report_recipient(
         for key in responses.keys():
             dynamic_fields.add(str(key))
 
-        # Read the latest persisted reply directly from email_replies as the
-        # source of truth for CSV export. This prevents the CSV from showing
-        # empty reply fields if an older simulation_recipient summary was not
-        # populated by a previous sync.
-        latest_reply = await db.email_replies.find_one(
-            {
-                "simulation_id": r["simulation_id"],
-                "recipient_id": r["id"],
-            },
-            {"_id": 0},
-            sort=[("received_at", -1)],
-        )
-        reply_text = _clean_reply_text(
-            (latest_reply or {}).get("reply_text") or r.get("reply_text", "")
-        )
-        reply_attachments = (latest_reply or {}).get("attachments") or r.get("attachments") or []
-        attachment_names = ", ".join(
-            a.get("filename", "") for a in reply_attachments if a.get("filename")
-        ) or r.get("attachment_names", "")
-
         row = {
             "simulation_id": s.get("sim_id", ""),
             "recipient_email": r.get("email", ""),
@@ -1857,11 +1851,11 @@ async def report_recipient(
             "form_submitted": r.get("form_submitted"),
             "submission_time": r.get("form_submitted_at"),
             "last_activity": r.get("last_activity"),
-            "reply_received": bool(latest_reply) or bool(r.get("reply_received", False)),
-            "reply_text": reply_text,
-            "reply_received_at": (latest_reply or {}).get("received_at") or r.get("reply_received_at"),
-            "attachment_count": len(reply_attachments) if latest_reply else r.get("attachment_count", 0),
-            "attachment_names": attachment_names,
+            "reply_received": r.get("reply_received", False),
+            "reply_text": r.get("reply_text", ""),
+            "reply_received_at": r.get("reply_received_at"),
+            "attachment_count": r.get("attachment_count", 0),
+            "attachment_names": r.get("attachment_names", ""),
             **responses,
         }
 
@@ -2015,6 +2009,7 @@ async def startup():
     await db.email_replies.create_index("message_id", unique=True)
     await db.email_replies.create_index("thread_id")
     await db.email_replies.create_index("recipient_id")
+    await db.gmail_sync_state.create_index("id", unique=True)
 
     app.state.reply_sync_task = asyncio.create_task(_reply_sync_loop())
 
