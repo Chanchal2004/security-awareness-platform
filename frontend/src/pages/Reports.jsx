@@ -207,7 +207,6 @@ export default function Reports() {
                 {recipientRows.map((row) => {
                   const replyCount = row.reply_count || 0;
                   const attachmentCount = row.attachment_count || 0;
-                  const hasDetails = replyCount > 0 || attachmentCount > 0;
                   const simulation = sims.find((s) => s.id === row.simulation_id);
 
                   return (
