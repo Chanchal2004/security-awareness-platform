@@ -1471,10 +1471,10 @@ async def _sync_incoming_replies() -> dict:
     for item in incoming:
         message_id = item.get("id")
         thread_id = item.get("thread_id")
-        if not message_id or not thread_id:
+        if not message_id:
             continue
 
-        candidates = by_thread.get(thread_id, [])
+        candidates = by_thread.get(thread_id, []) if thread_id else []
 
         # Ignore messages already imported.
         if await db.email_replies.find_one({"message_id": message_id}, {"_id": 1}):
@@ -1502,12 +1502,13 @@ async def _sync_incoming_replies() -> dict:
                 and _normalize_subject(row.get("subject", "")) == incoming_subject
             ]
             if not fallback:
-                # If the subject was altered by the mail client, sender-only
-                # matching is still useful when there is exactly one candidate.
-                fallback = [
+                # If the subject was altered by the mail client, only use a
+                # sender-only match when that sender has exactly one sent row.
+                sender_only = [
                     row for row in sent_rows
                     if row.get("email", "").lower().strip() == sender_email
                 ]
+                fallback = sender_only if len(sender_only) == 1 else []
             fallback.sort(key=lambda row: row.get("last_activity") or "", reverse=True)
             candidate = fallback[0] if fallback else None
 
