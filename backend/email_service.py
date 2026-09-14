@@ -6,6 +6,7 @@ import json
 import base64
 
 import msal
+import httpx
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
