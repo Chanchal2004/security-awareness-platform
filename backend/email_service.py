@@ -5,8 +5,8 @@ import logging
 import json
 import base64
 
-import msal
 import httpx
+import msal
 
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -587,20 +587,13 @@ async def send_email(
 async def find_incoming_replies(
     *,
     after_message_id: str | None = None,
-    max_results: int = 20,
+    max_results: int = 50,
 ) -> list[dict]:
-    """
-    Find recent inbox messages with a low Gmail API query cost.
 
-    We only fetch message metadata here. The full message body and attachment
-    data are fetched later *only after* the backend has identified a matching
-    simulation recipient. This avoids the previous pattern of doing 1 list +
-    up to 50 full-message requests on every sync, which could exhaust Gmail's
-    per-user query-cost quota.
-    """
     gmail_service = _get_gmail_service()
 
     try:
+
         result = (
             gmail_service
             .users()
@@ -608,22 +601,26 @@ async def find_incoming_replies(
             .list(
                 userId="me",
                 labelIds=["INBOX"],
-                q="newer_than:14d",
-                maxResults=min(max_results, 20),
+                maxResults=max_results,
             )
             .execute()
         )
 
-        messages = result.get("messages", [])
+        messages = result.get(
+            "messages",
+            []
+        )
+
         output = []
 
         for item in messages:
+
             message_id = item.get("id")
+
             if not message_id:
                 continue
 
-            # Metadata is enough for the backend to match sender/subject.
-            # Do NOT fetch the complete body for every inbox message.
+            # Fetch complete message
             message = (
                 gmail_service
                 .users()
@@ -631,31 +628,59 @@ async def find_incoming_replies(
                 .get(
                     userId="me",
                     id=message_id,
-                    format="metadata",
-                    metadataHeaders=["From", "To", "Subject", "Date"],
+                    format="full",
                 )
                 .execute()
             )
 
-            payload = message.get("payload", {})
+            payload = message.get(
+                "payload",
+                {}
+            )
+
             headers = {
-                h.get("name", "").lower(): h.get("value", "")
-                for h in payload.get("headers", [])
+                h.get("name", "").lower():
+                h.get("value", "")
+                for h in payload.get(
+                    "headers",
+                    []
+                )
             }
 
-            output.append({
-                "id": message_id,
-                "thread_id": message.get("threadId"),
-                "from": headers.get("from", ""),
-                "to": headers.get("to", ""),
-                "subject": headers.get("subject", ""),
-                "date": headers.get("date", ""),
-            })
+            output.append(
+                {
+                    "id": message_id,
+                    "thread_id": message.get(
+                        "threadId"
+                    ),
+                    "from": headers.get(
+                        "from",
+                        ""
+                    ),
+                    "to": headers.get(
+                        "to",
+                        ""
+                    ),
+                    "subject": headers.get(
+                        "subject",
+                        ""
+                    ),
+                    "date": headers.get(
+                        "date",
+                        ""
+                    ),
+                    "payload": payload,
+                }
+            )
 
         return output
 
     except Exception:
-        logger.exception("Failed to read incoming Gmail messages.")
+
+        logger.exception(
+            "Failed to read incoming Gmail messages."
+        )
+
         raise
 
 
