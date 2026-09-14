@@ -1436,9 +1436,15 @@ def _clean_reply_text(value: str) -> str:
 
 
 def _normalize_subject(value: str) -> str:
-    value = (value or "").strip().lower()
-    while value.startswith("re:"):
-        value = value[3:].strip()
+    """Normalize common reply/forward prefixes added by mail clients."""
+    value = html_lib.unescape(value or "").strip().lower()
+    # Remove common external-mail/security prefixes.
+    value = re.sub(r"\[external[^\]]*\]", " ", value, flags=re.I)
+    value = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", value, flags=re.I)
+    # Some clients stack prefixes: Re: Re: Subject.
+    while re.match(r"^\s*(?:re|fw|fwd)\s*:\s*", value, flags=re.I):
+        value = re.sub(r"^\s*(?:re|fw|fwd)\s*:\s*", "", value, count=1, flags=re.I)
+    value = re.sub(r"\s+", " ", value).strip(" -")
     return value
 
 
@@ -1496,21 +1502,35 @@ async def _sync_incoming_replies() -> dict:
         )
 
         if not candidate:
-            fallback = [
+            sender_rows = [
                 row for row in sent_rows
                 if row.get("email", "").lower().strip() == sender_email
-                and _normalize_subject(row.get("subject", "")) == incoming_subject
             ]
-            if not fallback:
-                # If the subject was altered by the mail client, only use a
-                # sender-only match when that sender has exactly one sent row.
-                sender_only = [
-                    row for row in sent_rows
-                    if row.get("email", "").lower().strip() == sender_email
-                ]
-                fallback = sender_only if len(sender_only) == 1 else []
+
+            # First match the normalized subject. If the same recipient received
+            # multiple simulations with the same subject, the latest sent row is
+            # the best deterministic match.
+            fallback = [
+                row for row in sender_rows
+                if _normalize_subject(row.get("subject", "")) == incoming_subject
+            ]
             fallback.sort(key=lambda row: row.get("last_activity") or "", reverse=True)
-            candidate = fallback[0] if fallback else None
+
+            if fallback:
+                candidate = fallback[0]
+            elif len(sender_rows) == 1:
+                # Safe sender-only fallback when there is only one possible row.
+                candidate = sender_rows[0]
+            elif sender_rows:
+                # Graph-sent messages do not provide Gmail thread IDs. When the
+                # mail client changes the subject, associate the reply with the
+                # most recently sent simulation for that recipient. This is what
+                # makes repeated tests to the same Gmail address work reliably.
+                sender_rows.sort(
+                    key=lambda row: row.get("last_activity") or "",
+                    reverse=True,
+                )
+                candidate = sender_rows[0]
 
         if not candidate:
             continue
@@ -1800,6 +1820,26 @@ async def report_recipient(
         for key in responses.keys():
             dynamic_fields.add(str(key))
 
+        # Read the latest persisted reply directly from email_replies as the
+        # source of truth for CSV export. This prevents the CSV from showing
+        # empty reply fields if an older simulation_recipient summary was not
+        # populated by a previous sync.
+        latest_reply = await db.email_replies.find_one(
+            {
+                "simulation_id": r["simulation_id"],
+                "recipient_id": r["id"],
+            },
+            {"_id": 0},
+            sort=[("received_at", -1)],
+        )
+        reply_text = _clean_reply_text(
+            (latest_reply or {}).get("reply_text") or r.get("reply_text", "")
+        )
+        reply_attachments = (latest_reply or {}).get("attachments") or r.get("attachments") or []
+        attachment_names = ", ".join(
+            a.get("filename", "") for a in reply_attachments if a.get("filename")
+        ) or r.get("attachment_names", "")
+
         row = {
             "simulation_id": s.get("sim_id", ""),
             "recipient_email": r.get("email", ""),
@@ -1817,11 +1857,11 @@ async def report_recipient(
             "form_submitted": r.get("form_submitted"),
             "submission_time": r.get("form_submitted_at"),
             "last_activity": r.get("last_activity"),
-            "reply_received": r.get("reply_received", False),
-            "reply_text": r.get("reply_text", ""),
-            "reply_received_at": r.get("reply_received_at"),
-            "attachment_count": r.get("attachment_count", 0),
-            "attachment_names": r.get("attachment_names", ""),
+            "reply_received": bool(latest_reply) or bool(r.get("reply_received", False)),
+            "reply_text": reply_text,
+            "reply_received_at": (latest_reply or {}).get("received_at") or r.get("reply_received_at"),
+            "attachment_count": len(reply_attachments) if latest_reply else r.get("attachment_count", 0),
+            "attachment_names": attachment_names,
             **responses,
         }
 
