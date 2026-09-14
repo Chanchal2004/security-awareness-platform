@@ -8,6 +8,7 @@ import re
 import io
 import asyncio
 import csv
+import html as html_lib
 import uuid
 import secrets
 import logging
@@ -1406,16 +1407,50 @@ async def _save_reply_attachment(
     }
 
 
+def _clean_reply_text(value: str) -> str:
+    """Return only the human-readable part of a reply, without quoted HTML/history."""
+    text = html_lib.unescape(value or "")
+
+    # Convert common HTML line/container tags to line breaks before stripping tags.
+    text = re.sub(r"<\s*(br|/p|/div|/li|/tr)\s*/?>", "\n", text, flags=re.I)
+    text = re.sub(r"<\s*(p|div|li|tr|td|table|tbody|span)[^>]*>", "", text, flags=re.I)
+    text = re.sub(r"<style[^>]*>.*?</style>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<script[^>]*>.*?</script>", " ", text, flags=re.I | re.S)
+    text = re.sub(r"<[^>]+>", " ", text)
+
+    # Remove the common Gmail/Outlook quoted-history marker and everything after it.
+    text = re.split(r"\s+On\s+.{1,400}?\s+wrote:\s*", text, maxsplit=1, flags=re.I | re.S)[0]
+    text = re.split(r"\s*-{2,}\s*Original Message\s*-{2,}\s*", text, maxsplit=1, flags=re.I)[0]
+
+    # Remove quoted lines left by plain-text replies.
+    lines = []
+    for line in text.splitlines():
+        if line.strip().startswith(">"):
+            continue
+        lines.append(line.rstrip())
+
+    text = "\n".join(lines)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def _normalize_subject(value: str) -> str:
+    value = (value or "").strip().lower()
+    while value.startswith("re:"):
+        value = value[3:].strip()
+    return value
+
+
 async def _sync_incoming_replies() -> dict:
     """
-    Read the authorized Gmail inbox and attach only replies belonging to
-    simulation recipients whose outgoing Gmail thread_id is known.
+    Read the authorized Gmail inbox and associate replies with the correct
+    simulation recipient. Gmail thread_id is preferred; Microsoft Graph-sent
+    messages do not expose a Gmail thread_id, so sender + subject + most recent
+    matching sent recipient are used as a fallback.
     """
     sent_rows = await db.simulation_recipients.find(
-        {
-            "sent": True,
-            "thread_id": {"$exists": True, "$nin": [None, ""]},
-        },
+        {"sent": True},
         {"_id": 0},
     ).to_list(50000)
 
@@ -1425,7 +1460,7 @@ async def _sync_incoming_replies() -> dict:
         if thread_id:
             by_thread.setdefault(thread_id, []).append(row)
 
-    if not by_thread:
+    if not sent_rows:
         return {"checked": 0, "matched": 0, "new_replies": 0, "attachments": 0}
 
     incoming = await find_incoming_replies(max_results=100)
@@ -1440,8 +1475,6 @@ async def _sync_incoming_replies() -> dict:
             continue
 
         candidates = by_thread.get(thread_id, [])
-        if not candidates:
-            continue
 
         # Ignore messages already imported.
         if await db.email_replies.find_one({"message_id": message_id}, {"_id": 1}):
@@ -1449,8 +1482,11 @@ async def _sync_incoming_replies() -> dict:
 
         details = await get_incoming_message_details(message_id)
         sender_email = _email_from_header(details.get("from", ""))
+        incoming_subject = _normalize_subject(details.get("subject", ""))
 
-        # Only accept a reply from the recipient assigned to that simulation.
+        # Prefer the Gmail thread match. If Graph sent the original message,
+        # there is no Gmail thread_id, so fall back to recipient + subject and
+        # select the most recently sent matching simulation.
         candidate = next(
             (
                 row for row in candidates
@@ -1458,6 +1494,23 @@ async def _sync_incoming_replies() -> dict:
             ),
             None,
         )
+
+        if not candidate:
+            fallback = [
+                row for row in sent_rows
+                if row.get("email", "").lower().strip() == sender_email
+                and _normalize_subject(row.get("subject", "")) == incoming_subject
+            ]
+            if not fallback:
+                # If the subject was altered by the mail client, sender-only
+                # matching is still useful when there is exactly one candidate.
+                fallback = [
+                    row for row in sent_rows
+                    if row.get("email", "").lower().strip() == sender_email
+                ]
+            fallback.sort(key=lambda row: row.get("last_activity") or "", reverse=True)
+            candidate = fallback[0] if fallback else None
+
         if not candidate:
             continue
 
@@ -1500,7 +1553,7 @@ async def _sync_incoming_replies() -> dict:
             "recipient_email": candidate["email"],
             "from": sender_email,
             "subject": details.get("subject", ""),
-            "reply_text": details.get("reply_text", ""),
+            "reply_text": _clean_reply_text(details.get("reply_text", "")),
             "received_at": received_at,
             "attachments": attachments,
             "created_at": now_iso(),
@@ -1515,7 +1568,7 @@ async def _sync_incoming_replies() -> dict:
             {
                 "$set": {
                     "reply_received": True,
-                    "reply_text": details.get("reply_text", ""),
+                    "reply_text": _clean_reply_text(details.get("reply_text", "")),
                     "reply_received_at": received_at,
                     "attachments": attachments,
                     "attachment_count": len(attachments),
@@ -1646,6 +1699,68 @@ async def _reply_sync_loop():
         except Exception:
             logger.exception("Background Gmail reply sync failed")
         await asyncio.sleep(300)
+
+
+@api.get("/reports/recipient-data")
+async def report_recipient_data(
+    simulation_id: Optional[str] = None,
+    user: dict = Depends(get_current_user),
+):
+    """JSON data for the Recipient Report UI, including replies and attachments."""
+    q = {"simulation_id": simulation_id} if simulation_id else {}
+    recips = await db.simulation_recipients.find(q, {"_id": 0}).to_list(50000)
+
+    replies = await db.email_replies.find(
+        q,
+        {"_id": 0},
+    ).sort("received_at", -1).to_list(50000)
+
+    replies_by_recipient = {}
+    for reply in replies:
+        clean = {
+            "id": reply.get("id") or reply.get("message_id"),
+            "subject": reply.get("subject", ""),
+            "reply_text": _clean_reply_text(reply.get("reply_text", "")),
+            "received_at": reply.get("received_at"),
+            "attachments": [
+                {
+                    "file_id": a.get("file_id"),
+                    "filename": a.get("filename"),
+                    "mime_type": a.get("mime_type"),
+                    "size": a.get("size", 0),
+                }
+                for a in reply.get("attachments", [])
+            ],
+        }
+        replies_by_recipient.setdefault(reply.get("recipient_id"), []).append(clean)
+
+    rows = []
+    for r in recips:
+        recipient_replies = replies_by_recipient.get(r.get("id"), [])
+        rows.append({
+            "id": r.get("id"),
+            "simulation_id": r.get("simulation_id"),
+            "recipient_email": r.get("email", ""),
+            "department": r.get("department", ""),
+            "sent": r.get("sent", False),
+            "delivered": r.get("delivery_status"),
+            "first_open": r.get("first_open"),
+            "last_open": r.get("last_open"),
+            "open_count": r.get("open_count", 0),
+            "first_click": r.get("first_click"),
+            "last_click": r.get("last_click"),
+            "click_count": r.get("click_count", 0),
+            "landing_page_visited": r.get("landing_visited", False),
+            "form_started": r.get("form_started", False),
+            "form_submitted": r.get("form_submitted", False),
+            "submission_time": r.get("form_submitted_at"),
+            "last_activity": r.get("last_activity"),
+            "replies": recipient_replies,
+            "reply_count": len(recipient_replies),
+            "attachment_count": sum(len(x.get("attachments", [])) for x in recipient_replies),
+        })
+
+    return rows
 
 
 @api.get("/reports/recipient")
