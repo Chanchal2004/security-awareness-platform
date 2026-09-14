@@ -1699,7 +1699,7 @@ async def _reply_sync_loop():
             raise
         except Exception:
             logger.exception("Background Gmail reply sync failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(900)
 
 
 @api.get("/reports/recipient-data")
