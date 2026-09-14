@@ -1440,8 +1440,15 @@ def _clean_reply_text(value: str) -> str:
 
 def _normalize_subject(value: str) -> str:
     value = (value or "").strip().lower()
-    while value.startswith("re:"):
-        value = value[3:].strip()
+    while True:
+        old = value
+        for prefix in ("re:", "fw:", "fwd:"):
+            if value.startswith(prefix):
+                value = value[len(prefix):].strip()
+                break
+        if value == old:
+            break
+    value = re.sub(r"^\[external\]\s*", "", value, flags=re.I)
     return value
 
 
@@ -1486,7 +1493,7 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
         try:
             scan = await find_incoming_replies(
                 start_history_id=start_history_id,
-                max_results=50,
+                max_results=30,
             )
         except Exception as exc:
             # Do not turn a temporary Gmail quota/rate-limit condition into a
@@ -1505,12 +1512,6 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
 
         incoming = scan.get("messages", [])
         history_id = scan.get("history_id")
-        if history_id:
-            await db.gmail_sync_state.update_one(
-                {"id": "incoming_replies"},
-                {"$set": {"id": "incoming_replies", "history_id": str(history_id), "updated_at": now_iso()}},
-                upsert=True,
-            )
 
         by_thread = {}
         for row in sent_rows:
@@ -1547,13 +1548,23 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                     row for row in sent_by_sender.get(sender_email, [])
                     if _normalize_subject(row.get("subject", "")) == incoming_subject
                 ]
+                # If the employee changed the subject or the mail client did
+                # not preserve the original thread, attach the reply to the
+                # most recently sent simulation for that employee. This also
+                # handles repeated tests to the same address.
                 if not fallback:
-                    sender_rows = sent_by_sender.get(sender_email, [])
-                    fallback = sender_rows if len(sender_rows) == 1 else []
-                fallback.sort(key=lambda row: row.get("last_activity") or "", reverse=True)
+                    fallback = list(sent_by_sender.get(sender_email, []))
+                fallback.sort(
+                    key=lambda row: (row.get("last_activity") or row.get("sent_at") or ""),
+                    reverse=True,
+                )
                 candidate = fallback[0] if fallback else None
 
             if not candidate:
+                logger.warning(
+                    "Could not match incoming reply %s from %s subject=%r to a sent recipient.",
+                    message_id, sender_email, item.get("subject", ""),
+                )
                 continue
 
             matched += 1
@@ -1624,6 +1635,15 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                 upsert=True,
             )
             new_replies += 1
+
+        # Advance the history checkpoint only after the messages have been
+        # processed successfully. This makes transient failures retryable.
+        if history_id:
+            await db.gmail_sync_state.update_one(
+                {"id": "incoming_replies"},
+                {"$set": {"id": "incoming_replies", "history_id": str(history_id), "updated_at": now_iso()}},
+                upsert=True,
+            )
 
         return {
             "checked": len(incoming),
