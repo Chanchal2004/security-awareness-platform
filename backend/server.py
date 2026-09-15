@@ -22,6 +22,8 @@ from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 from bson import ObjectId
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
+from openpyxl import Workbook
+from openpyxl.styles import Font, Alignment
 
 from db import db
 from security import (
@@ -1818,117 +1820,115 @@ async def report_recipient_data(
     return rows
 
 
-@api.get("/reports/recipient")
-async def report_recipient(
-    simulation_id: Optional[str] = None,
-    user: dict = Depends(get_current_user)
-):
+async def _build_recipient_report_rows(simulation_id: Optional[str] = None):
     q = {"simulation_id": simulation_id} if simulation_id else {}
-
-    recips = await db.simulation_recipients.find(
-        q, {"_id": 0}
-    ).to_list(50000)
-
-    sims = {
-        s["id"]: s
-        for s in await db.simulations.find({}, {"_id": 0}).to_list(5000)
-    }
-
+    recips = await db.simulation_recipients.find(q, {"_id": 0}).to_list(50000)
+    sims = {s["id"]: s for s in await db.simulations.find({}, {"_id": 0}).to_list(5000)}
     rows = []
     dynamic_fields = set()
-
     for r in recips:
-        s = sims.get(r["simulation_id"], {})
-
+        s = sims.get(r.get("simulation_id"), {})
         submission = await db.form_submissions.find_one(
-            {
-                "simulation_id": r["simulation_id"],
-                "recipient_id": r["id"]
-            },
-            {"_id": 0},
-            sort=[("timestamp", -1)]
+            {"simulation_id": r.get("simulation_id"), "recipient_id": r.get("id")},
+            {"_id": 0}, sort=[("timestamp", -1)]
         )
-
         responses = submission.get("responses", {}) if submission else {}
-
         latest_reply = await db.email_replies.find_one(
-            {"simulation_id": r["simulation_id"], "recipient_id": r["id"]},
-            {"_id": 0},
-            sort=[("received_at", -1)]
+            {"simulation_id": r.get("simulation_id"), "recipient_id": r.get("id")},
+            {"_id": 0}, sort=[("received_at", -1)]
         )
         reply_attachments = (latest_reply or {}).get("attachments", [])
         reply_text = _clean_reply_text((latest_reply or {}).get("reply_text", ""))
         reply_received_at = (latest_reply or {}).get("received_at")
-
-        for key in responses.keys():
-            dynamic_fields.add(str(key))
-
+        for key in responses.keys(): dynamic_fields.add(str(key))
         row = {
             "simulation_id": s.get("sim_id", ""),
             "recipient_email": r.get("email", ""),
             "department": r.get("department", ""),
-            "sent": r.get("sent"),
-            "delivered": r.get("delivery_status"),
-            "first_open": r.get("first_open"),
-            "last_open": r.get("last_open"),
-            "open_count": r.get("open_count"),
-            "first_click": r.get("first_click"),
-            "last_click": r.get("last_click"),
-            "click_count": r.get("click_count"),
-            "landing_page_visited": r.get("landing_visited"),
-            "form_started": r.get("form_started"),
-            "form_submitted": r.get("form_submitted"),
-            "submission_time": r.get("form_submitted_at"),
+            "sent": r.get("sent"), "delivered": r.get("delivery_status"),
+            "first_open": r.get("first_open"), "last_open": r.get("last_open"),
+            "open_count": r.get("open_count"), "first_click": r.get("first_click"),
+            "last_click": r.get("last_click"), "click_count": r.get("click_count"),
+            "landing_page_visited": r.get("landing_visited"), "form_started": r.get("form_started"),
+            "form_submitted": r.get("form_submitted"), "submission_time": r.get("form_submitted_at"),
             "last_activity": r.get("last_activity"),
             "reply_received": bool(latest_reply) or r.get("reply_received", False),
             "reply_text": reply_text or r.get("reply_text", ""),
             "reply_received_at": reply_received_at or r.get("reply_received_at"),
             "attachment_count": len(reply_attachments) if latest_reply else r.get("attachment_count", 0),
             "attachment_names": ", ".join(a.get("filename", "") for a in reply_attachments) if latest_reply else r.get("attachment_names", ""),
+            "_attachment_files": reply_attachments,
             **responses,
         }
-
         rows.append(row)
+    return rows, dynamic_fields
 
+@api.get("/reports/recipient")
+async def report_recipient(simulation_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    rows, dynamic_fields = await _build_recipient_report_rows(simulation_id)
     base_columns = [
-        "simulation_id",
-        "recipient_email",
-        "department",
-        "sent",
-        "delivered",
-        "first_open",
-        "last_open",
-        "open_count",
-        "first_click",
-        "last_click",
-        "click_count",
-        "landing_page_visited",
-        "form_started",
-        "form_submitted",
-        "submission_time",
-        "last_activity",
-        "reply_received",
-        "reply_text",
-        "reply_received_at",
-        "attachment_count",
-        "attachment_names",
+        "simulation_id", "recipient_email", "department", "sent", "delivered",
+        "first_open", "last_open", "open_count", "first_click", "last_click", "click_count",
+        "landing_page_visited", "form_started", "form_submitted", "submission_time", "last_activity",
+        "reply_received", "reply_text", "reply_received_at", "attachment_count", "attachment_names",
     ]
-
     columns = base_columns + sorted(dynamic_fields)
+    await log_audit(user["email"], "REPORT_EXPORTED", None, "Recipient report")
+    return csv_response(rows, columns, "recipient_report.csv")
 
-    await log_audit(
-        user["email"],
-        "REPORT_EXPORTED",
-        None,
-        "Recipient report"
-    )
-
-    return csv_response(
-        rows,
-        columns,
-        "recipient_report.csv"
-    )
-
+@api.get("/reports/recipient.xlsx")
+async def report_recipient_xlsx(simulation_id: Optional[str] = None, user: dict = Depends(get_current_user)):
+    """Excel-native recipient report. Attachment names are real clickable hyperlinks."""
+    rows, dynamic_fields = await _build_recipient_report_rows(simulation_id)
+    base_columns = [
+        "simulation_id", "recipient_email", "department", "sent", "delivered",
+        "first_open", "last_open", "open_count", "first_click", "last_click", "click_count",
+        "landing_page_visited", "form_started", "form_submitted", "submission_time", "last_activity",
+        "reply_received", "reply_text", "reply_received_at", "attachment_count", "attachment_names",
+    ]
+    columns = base_columns + sorted(dynamic_fields)
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Recipient Report"
+    for col_idx, col in enumerate(columns, 1):
+        c = ws.cell(1, col_idx, col)
+        c.font = Font(bold=True)
+        c.alignment = Alignment(vertical="top", wrap_text=True)
+    # Add one dedicated clickable column per possible attachment.
+    max_files = max((len(r.get("_attachment_files", [])) for r in rows), default=0)
+    file_cols = []
+    for i in range(max_files):
+        name = f"Document {i+1}"
+        file_cols.append(name)
+        c = ws.cell(1, len(columns) + i + 1, name)
+        c.font = Font(bold=True)
+    for ridx, row in enumerate(rows, 2):
+        for cidx, col in enumerate(columns, 1):
+            value = row.get(col, "")
+            ws.cell(ridx, cidx, "" if value is None else str(value))
+        for i, a in enumerate(row.get("_attachment_files", [])):
+            file_id = a.get("file_id")
+            filename = a.get("filename") or "Document"
+            if not file_id: continue
+            cell = ws.cell(ridx, len(columns) + i + 1, filename)
+            cell.hyperlink = f"{PUBLIC_BASE_URL.rstrip('/')}/api/replies/attachments/{file_id}"
+            cell.style = "Hyperlink"
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        # Make reply readable in Excel.
+        ws.cell(ridx, columns.index("reply_text") + 1).alignment = Alignment(vertical="top", wrap_text=True)
+    for i, col in enumerate(columns, 1):
+        ws.column_dimensions[ws.cell(1, i).column_letter].width = min(max(len(col) + 2, 14), 28)
+    if "reply_text" in columns:
+        ws.column_dimensions[ws.cell(1, columns.index("reply_text") + 1).column_letter].width = 45
+    for i in range(max_files):
+        ws.column_dimensions[ws.cell(1, len(columns) + i + 1).column_letter].width = 28
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+    out = io.BytesIO()
+    wb.save(out); out.seek(0)
+    await log_audit(user["email"], "REPORT_EXPORTED", None, "Recipient Excel report")
+    return StreamingResponse(iter([out.getvalue()]), media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                             headers={"Content-Disposition": 'attachment; filename="recipient_report.xlsx"'})
 
 @api.get("/reports/department")
 async def report_department(user: dict = Depends(get_current_user)):
