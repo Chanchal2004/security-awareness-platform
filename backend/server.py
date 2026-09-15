@@ -12,6 +12,10 @@ import html as html_lib
 import uuid
 import secrets
 import logging
+import base64
+import hashlib
+import hmac
+import json
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 
@@ -1704,11 +1708,44 @@ async def list_replies(
     return replies
 
 
+def _attachment_share_token(file_id: str, expires_days: int = 7) -> str:
+    """Create a short-lived signed URL token so Excel hyperlinks can open files without app login."""
+    payload = {
+        "file_id": file_id,
+        "exp": int((datetime.now(timezone.utc) + timedelta(days=expires_days)).timestamp()),
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    secret = os.environ.get("JWT_SECRET") or os.environ.get("SECRET_KEY") or "attachment-link-secret"
+    encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
+    sig = hmac.new(secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+    return f"{encoded}.{sig}"
+
+
+def _verify_attachment_share_token(token: str, file_id: str) -> bool:
+    try:
+        encoded, sig = token.split(".", 1)
+        secret = os.environ.get("JWT_SECRET") or os.environ.get("SECRET_KEY") or "attachment-link-secret"
+        expected = hmac.new(secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return False
+        padded = encoded + "=" * (-len(encoded) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")))
+        return payload.get("file_id") == file_id and int(payload.get("exp", 0)) >= int(datetime.now(timezone.utc).timestamp())
+    except Exception:
+        return False
+
+
 @api.get("/replies/attachments/{file_id}")
 async def download_reply_attachment(
     file_id: str,
-    user: dict = Depends(get_current_user),
+    token: Optional[str] = Query(None),
+    user: Optional[dict] = Depends(get_current_user),
 ):
+    # Browser/Excel direct links do not send the app's Authorization header.
+    # Accept either the normal logged-in session OR a signed short-lived token
+    # generated in the Excel export.
+    if user is None and not (token and _verify_attachment_share_token(token, file_id)):
+        raise HTTPException(status_code=401, detail="Not authenticated")
     try:
         object_id = ObjectId(file_id)
     except Exception:
@@ -1911,7 +1948,8 @@ async def report_recipient_xlsx(simulation_id: Optional[str] = None, user: dict 
             filename = a.get("filename") or "Document"
             if not file_id: continue
             cell = ws.cell(ridx, len(columns) + i + 1, filename)
-            cell.hyperlink = f"{PUBLIC_BASE_URL.rstrip('/')}/api/replies/attachments/{file_id}"
+            share_token = _attachment_share_token(file_id)
+            cell.hyperlink = f"{PUBLIC_BASE_URL.rstrip('/')}/api/replies/attachments/{file_id}?token={share_token}"
             cell.style = "Hyperlink"
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         # Make reply readable in Excel.
