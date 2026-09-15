@@ -118,13 +118,16 @@ export default function Reports() {
 
   const download = async (key) => {
     try {
-      const url = (key === "recipient" || key === "event") && simId
-        ? `/reports/${key}?simulation_id=${encodeURIComponent(simId)}`
-        : `/reports/${key}`;
+      const isRecipient = key === "recipient";
+      const url = isRecipient
+        ? `/reports/recipient.xlsx${simId ? `?simulation_id=${encodeURIComponent(simId)}` : ""}`
+        : ((key === "event") && simId
+          ? `/reports/${key}?simulation_id=${encodeURIComponent(simId)}`
+          : `/reports/${key}`);
       const res = await api.get(url, { responseType: "blob" });
       const a = document.createElement("a");
       a.href = URL.createObjectURL(res.data);
-      a.download = `${key}_report.csv`;
+      a.download = isRecipient ? "recipient_report.xlsx" : `${key}_report.csv`;
       a.click();
       URL.revokeObjectURL(a.href);
       toast.success("Report exported");
