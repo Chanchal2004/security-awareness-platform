@@ -1739,13 +1739,12 @@ def _verify_attachment_share_token(token: str, file_id: str) -> bool:
 async def download_reply_attachment(
     file_id: str,
     token: Optional[str] = Query(None),
-    user: Optional[dict] = Depends(get_current_user),
 ):
-    # Browser/Excel direct links do not send the app's Authorization header.
-    # Accept either the normal logged-in session OR a signed short-lived token
-    # generated in the Excel export.
-    if user is None and not (token and _verify_attachment_share_token(token, file_id)):
-        raise HTTPException(status_code=401, detail="Not authenticated")
+    # This endpoint is intentionally public because Excel/browser hyperlinks do not
+    # send the app Authorization header. Access is granted only with a signed,
+    # short-lived token generated during the authenticated Excel export.
+    if not (token and _verify_attachment_share_token(token, file_id)):
+        raise HTTPException(status_code=401, detail="Invalid or expired attachment link")
     try:
         object_id = ObjectId(file_id)
     except Exception:
