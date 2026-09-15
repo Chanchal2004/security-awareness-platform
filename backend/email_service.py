@@ -718,14 +718,27 @@ async def find_incoming_replies(
 
             # Metadata is enough for matching. A full message is fetched only
             # after the server has identified a candidate reply.
-            message = _execute_gmail(
-                gmail_service.users().messages().get(
-                    userId="me",
-                    id=message_id,
-                    format="metadata",
-                    metadataHeaders=["From", "To", "Subject", "Date"],
+            try:
+                message = _execute_gmail(
+                    gmail_service.users().messages().get(
+                        userId="me",
+                        id=message_id,
+                        format="metadata",
+                        metadataHeaders=["From", "To", "Subject", "Date"],
+                    )
                 )
-            )
+            except HttpError as exc:
+                # A history record can point at a message that is no longer
+                # readable (for example after deletion/retention changes).
+                # Do not let one stale message ID abort the entire sync and
+                # block newer replies behind it.
+                if getattr(exc.resp, "status", None) == 404:
+                    logger.warning(
+                        "Skipping stale/unavailable Gmail message %s (404).",
+                        message_id,
+                    )
+                    continue
+                raise
             headers = {
                 h.get("name", "").lower(): h.get("value", "")
                 for h in (message.get("payload", {}) or {}).get("headers", [])
