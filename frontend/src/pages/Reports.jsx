@@ -79,6 +79,28 @@ export default function Reports() {
     loadRecipientReport(simId);
   }, [simId]);
 
+  // Keep the Recipient Report near-real-time. The backend uses Gmail History API
+  // after the first sync, so a 10-second poll stays lightweight and does not
+  // repeatedly scan the inbox.
+  useEffect(() => {
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const res = await api.post("/replies/sync");
+        if (!cancelled && (res.data?.new_replies || res.data?.attachments)) {
+          await loadRecipientReport(simId);
+        }
+      } catch (_) {
+        // Background polling must never interrupt the report UI.
+      }
+    };
+    const timer = setInterval(poll, 10000);
+    return () => {
+      cancelled = true;
+      clearInterval(timer);
+    };
+  }, [simId]);
+
   const syncReplies = async () => {
     setSyncing(true);
     try {
