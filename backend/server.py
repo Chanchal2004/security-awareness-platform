@@ -1357,7 +1357,7 @@ def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 # ---------------------------------------------------------------------------
 
 MAX_REPLY_ATTACHMENT_BYTES = 25 * 1024 * 1024
-REPLY_SYNC_INTERVAL_SECONDS = 60
+REPLY_SYNC_INTERVAL_SECONDS = 10
 REPLY_SYNC_LOCK = asyncio.Lock()
 _last_reply_sync_at = 0.0
 
@@ -1851,6 +1851,15 @@ async def report_recipient(
 
         responses = submission.get("responses", {}) if submission else {}
 
+        latest_reply = await db.email_replies.find_one(
+            {"simulation_id": r["simulation_id"], "recipient_id": r["id"]},
+            {"_id": 0},
+            sort=[("received_at", -1)]
+        )
+        reply_attachments = (latest_reply or {}).get("attachments", [])
+        reply_text = _clean_reply_text((latest_reply or {}).get("reply_text", ""))
+        reply_received_at = (latest_reply or {}).get("received_at")
+
         for key in responses.keys():
             dynamic_fields.add(str(key))
 
@@ -1871,11 +1880,11 @@ async def report_recipient(
             "form_submitted": r.get("form_submitted"),
             "submission_time": r.get("form_submitted_at"),
             "last_activity": r.get("last_activity"),
-            "reply_received": r.get("reply_received", False),
-            "reply_text": r.get("reply_text", ""),
-            "reply_received_at": r.get("reply_received_at"),
-            "attachment_count": r.get("attachment_count", 0),
-            "attachment_names": r.get("attachment_names", ""),
+            "reply_received": bool(latest_reply) or r.get("reply_received", False),
+            "reply_text": reply_text or r.get("reply_text", ""),
+            "reply_received_at": reply_received_at or r.get("reply_received_at"),
+            "attachment_count": len(reply_attachments) if latest_reply else r.get("attachment_count", 0),
+            "attachment_names": ", ".join(a.get("filename", "") for a in reply_attachments) if latest_reply else r.get("attachment_names", ""),
             **responses,
         }
 
