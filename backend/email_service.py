@@ -690,24 +690,25 @@ async def find_incoming_replies(
                 else:
                     raise
 
-        # Safety net: also inspect a small recent INBOX window on every sync.
-        # This is deliberately metadata-only and prevents a reply from being
-        # permanently missed if an earlier history checkpoint was advanced
-        # before the reply could be matched to a recipient.
-        recent_result = _execute_gmail(
-            gmail_service.users().messages().list(
-                userId="me",
-                labelIds=["INBOX"],
-                q="newer_than:14d",
-                maxResults=min(max_results, 30),
+        # First sync only: import a small recent INBOX window so replies that
+        # existed before the first history checkpoint are not lost. After a
+        # history checkpoint exists, do NOT rescan the inbox on every poll;
+        # that would waste Gmail quota and delay real-time polling.
+        if not start_history_id:
+            recent_result = _execute_gmail(
+                gmail_service.users().messages().list(
+                    userId="me",
+                    labelIds=["INBOX"],
+                    q="newer_than:14d",
+                    maxResults=min(max_results, 30),
+                )
             )
-        )
-        seen_ids = {item.get("id") for item in message_ids if item.get("id")}
-        for item in recent_result.get("messages", []):
-            mid = item.get("id")
-            if mid and mid not in seen_ids:
-                message_ids.append(item)
-                seen_ids.add(mid)
+            seen_ids = {item.get("id") for item in message_ids if item.get("id")}
+            for item in recent_result.get("messages", []):
+                mid = item.get("id")
+                if mid and mid not in seen_ids:
+                    message_ids.append(item)
+                    seen_ids.add(mid)
 
         output = []
         for item in message_ids[: max(1, min(max_results, 30))]:
