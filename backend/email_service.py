@@ -445,15 +445,23 @@ def _get_microsoft_msal_app():
 def _get_microsoft_access_token() -> str:
     app = _get_microsoft_msal_app()
 
-    accounts = app.get_accounts(username=MICROSOFT_SENDER_EMAIL)
-    if not accounts:
-        accounts = app.get_accounts()
+    # Strictly use the configured Microsoft mailbox.
+    # Do NOT fall back to another cached account: doing so can silently
+    # send/read mail from the wrong Outlook account.
+    accounts = app.get_accounts(
+        username=MICROSOFT_SENDER_EMAIL
+    )
 
     if not accounts:
+        cached_users = [
+            str(account.get("username") or "")
+            for account in app.get_accounts()
+        ]
         raise RuntimeError(
-            "No Microsoft login account was found in MICROSOFT_TOKEN_CACHE. "
-            "Run the local Microsoft login/token-cache generator again and copy the "
-            "complete MSAL cache JSON into Render."
+            f"No Microsoft account found for {MICROSOFT_SENDER_EMAIL!r} "
+            f"in MICROSOFT_TOKEN_CACHE. Cached accounts: {cached_users}. "
+            "Generate a fresh MSAL cache using the same mailbox and paste the "
+            "complete cache JSON into Render."
         )
 
     result = app.acquire_token_silent(
@@ -523,7 +531,6 @@ async def send_email(
         created = create_response.json()
         message_id = created.get("id")
         conversation_id = created.get("conversationId")
-        internet_message_id = created.get("internetMessageId")
         if not message_id:
             raise RuntimeError("Microsoft Graph did not return a message ID.")
 
@@ -544,11 +551,7 @@ async def send_email(
         "Email sent via Microsoft Graph to %s from %s (message=%s, conversation=%s)",
         to, MICROSOFT_SENDER_EMAIL, message_id, conversation_id,
     )
-    return {
-        "id": message_id,
-        "thread_id": conversation_id,
-        "internet_message_id": internet_message_id,
-    }
+    return {"id": message_id, "thread_id": conversation_id}
 
 
 # ============================================================
@@ -614,20 +617,22 @@ async def find_incoming_replies(
     after_message_id: str | None = None,
     max_results: int = 500,
 ) -> _ReplyScan:
-    """Find incoming Microsoft Graph mail, including replies and attachments.
+    """Find incoming Outlook/Graph messages that may be replies.
 
-    Graph does not provide Gmail-style history IDs here, so we use paginated
-    Inbox/mailbox reads. We explicitly skip our own outgoing messages.
-    The caller performs the final correlation with sent simulation recipients.
+    Microsoft Graph does not provide Gmail-style history IDs for this flow, so
+    we read the Inbox and (as a fallback) the mailbox message collection.
+    Pagination is followed so an older reply is not hidden behind the newest
+    messages. Outgoing messages from our own mailbox are always ignored.
     """
     del start_history_id
     del after_message_id
 
     access_token = _get_microsoft_access_token()
     limit = max(1, min(int(max_results or 500), 500))
+    page_size = min(limit, 100)
     select = (
         "id,conversationId,internetMessageId,subject,from,toRecipients,"
-        "receivedDateTime,body,hasAttachments,parentFolderId,internetMessageHeaders"
+        "receivedDateTime,body,hasAttachments,parentFolderId"
     )
 
     headers = _graph_headers(access_token)
@@ -644,19 +649,17 @@ async def find_incoming_replies(
         for url_index, url in enumerate(urls):
             next_url = url
             params = {
-                "$top": "100",
+                "$top": str(page_size),
                 "$orderby": "receivedDateTime desc",
                 "$select": select,
             }
-            pages = 0
 
-            while next_url and len(output) < limit and pages < 10:
+            while next_url and len(output) < limit:
                 response = await client.get(
                     next_url,
                     headers=headers,
                     params=params if next_url == url else None,
                 )
-                pages += 1
 
                 if response.status_code != 200:
                     try:
@@ -670,9 +673,11 @@ async def find_incoming_replies(
                         detail,
                     )
                     if url_index == 0:
+                        # Inbox failure: try mailbox-wide scan.
                         break
                     raise RuntimeError(
-                        f"Microsoft Graph mailbox read failed (HTTP {response.status_code}): {detail}"
+                        f"Microsoft Graph mailbox read failed "
+                        f"(HTTP {response.status_code}): {detail}"
                     )
 
                 data = response.json()
@@ -685,6 +690,9 @@ async def find_incoming_replies(
                     seen_ids.add(message_id)
 
                     sender = _graph_address(message.get("from") or {})
+
+                    # /me/messages includes Sent Items. Never treat our own
+                    # outbound email as an incoming reply.
                     if own_sender and _normalize_email_address(sender) == own_sender:
                         continue
 
@@ -702,18 +710,10 @@ async def find_incoming_replies(
                         for x in (message.get("toRecipients") or [])
                     ]
 
-                    headers_map = {}
-                    for h in message.get("internetMessageHeaders") or []:
-                        name = (h.get("name") or "").lower().strip()
-                        if name:
-                            headers_map[name] = h.get("value") or ""
-
                     output.append({
                         "id": message_id,
                         "thread_id": message.get("conversationId"),
                         "internet_message_id": message.get("internetMessageId"),
-                        "in_reply_to": headers_map.get("in-reply-to", ""),
-                        "references": headers_map.get("references", ""),
                         "from": sender,
                         "to": ", ".join(x for x in recipients if x),
                         "subject": message.get("subject") or "",
@@ -725,11 +725,11 @@ async def find_incoming_replies(
                         "parent_folder_id": message.get("parentFolderId"),
                     })
 
+                    if len(output) >= limit:
+                        break
+
                 next_url = data.get("@odata.nextLink")
                 params = None
-
-                if not messages or not next_url:
-                    break
 
     output.sort(key=lambda item: item.get("date") or "", reverse=True)
     return output[:limit]
