@@ -136,12 +136,46 @@ export default function Reports() {
     }
   };
 
-  const attachmentUrl = (fileId) =>
-    `${api.defaults.baseURL || ""}/replies/attachments/${fileId}`;
-
-  const openAttachment = (file) => {
+  const openAttachment = async (file) => {
     if (!file?.file_id) return;
-    window.open(attachmentUrl(file.file_id), "_blank", "noopener,noreferrer");
+
+    try {
+      const res = await api.get(
+        `/replies/attachments/${encodeURIComponent(file.file_id)}`,
+        { responseType: "blob" }
+      );
+
+      const url = URL.createObjectURL(res.data);
+      window.open(url, "_blank", "noopener,noreferrer");
+
+      // Keep the blob URL alive long enough for the new tab to load it.
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    } catch (e) {
+      toast.error(apiError(e));
+    }
+  };
+
+  const downloadAttachment = async (file) => {
+    if (!file?.file_id) return;
+
+    try {
+      const res = await api.get(
+        `/replies/attachments/${encodeURIComponent(file.file_id)}`,
+        { responseType: "blob" }
+      );
+
+      const url = URL.createObjectURL(res.data);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = file.filename || "attachment";
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) {
+      toast.error(apiError(e));
+    }
   };
 
   return (
@@ -401,14 +435,14 @@ export default function Reports() {
                                 <ExternalLink className="h-3.5 w-3.5" />
                                 View
                               </button>
-                              <a
-                                href={attachmentUrl(file.file_id)}
-                                download={file.filename}
+                              <button
+                                type="button"
+                                onClick={() => downloadAttachment(file)}
                                 className="h-8 px-2.5 rounded-md border border-border text-xs flex items-center gap-1 hover:bg-muted"
                               >
                                 <Download className="h-3.5 w-3.5" />
                                 Download
-                              </a>
+                              </button>
                             </div>
                           </div>
                         ))}
