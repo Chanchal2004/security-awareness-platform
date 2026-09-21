@@ -523,6 +523,7 @@ async def send_email(
         created = create_response.json()
         message_id = created.get("id")
         conversation_id = created.get("conversationId")
+        internet_message_id = created.get("internetMessageId")
         if not message_id:
             raise RuntimeError("Microsoft Graph did not return a message ID.")
 
@@ -543,7 +544,11 @@ async def send_email(
         "Email sent via Microsoft Graph to %s from %s (message=%s, conversation=%s)",
         to, MICROSOFT_SENDER_EMAIL, message_id, conversation_id,
     )
-    return {"id": message_id, "thread_id": conversation_id}
+    return {
+        "id": message_id,
+        "thread_id": conversation_id,
+        "internet_message_id": internet_message_id,
+    }
 
 
 # ============================================================
@@ -607,31 +612,25 @@ async def find_incoming_replies(
     *,
     start_history_id: str | None = None,
     after_message_id: str | None = None,
-    max_results: int = 50,
+    max_results: int = 500,
 ) -> _ReplyScan:
-    """Find incoming mail that can be a reply to a sent simulation.
+    """Find incoming Microsoft Graph mail, including replies and attachments.
 
-    Microsoft Graph does not use Gmail history IDs.  We therefore scan both
-    Inbox and the mailbox message collection.  Messages sent by our own
-    Microsoft sender are explicitly ignored so the sync never treats our
-    outgoing Graph emails as incoming replies.
+    Graph does not provide Gmail-style history IDs here, so we use paginated
+    Inbox/mailbox reads. We explicitly skip our own outgoing messages.
+    The caller performs the final correlation with sent simulation recipients.
     """
     del start_history_id
     del after_message_id
 
     access_token = _get_microsoft_access_token()
-    top = max(1, min(int(max_results or 50), 100))
+    limit = max(1, min(int(max_results or 500), 500))
     select = (
         "id,conversationId,internetMessageId,subject,from,toRecipients,"
-        "receivedDateTime,body,hasAttachments,parentFolderId"
+        "receivedDateTime,body,hasAttachments,parentFolderId,internetMessageHeaders"
     )
 
     headers = _graph_headers(access_token)
-    # Inbox first: this is where an actual Gmail/recipient reply should land.
-    # Mailbox-wide scan is kept as a fallback for messages Graph exposes outside
-    # the Inbox.  We collect from both instead of stopping after the first
-    # non-empty result, because the newest mailbox messages can be our own sent
-    # messages and otherwise hide an older incoming reply.
     urls = [
         "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
         "https://graph.microsoft.com/v1.0/me/messages",
@@ -643,79 +642,97 @@ async def find_incoming_replies(
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for url_index, url in enumerate(urls):
+            next_url = url
             params = {
-                "$top": str(top),
+                "$top": "100",
                 "$orderby": "receivedDateTime desc",
                 "$select": select,
             }
+            pages = 0
 
-            response = await client.get(url, headers=headers, params=params)
-
-            if response.status_code != 200:
-                try:
-                    detail = response.json()
-                except Exception:
-                    detail = response.text
-                logger.warning(
-                    "Microsoft Graph mail scan failed for %s (HTTP %s): %s",
-                    url,
-                    response.status_code,
-                    detail,
+            while next_url and len(output) < limit and pages < 10:
+                response = await client.get(
+                    next_url,
+                    headers=headers,
+                    params=params if next_url == url else None,
                 )
-                if url_index == 0:
-                    # Continue with mailbox-wide scan if Inbox access fails.
-                    continue
-                raise RuntimeError(
-                    f"Microsoft Graph mailbox read failed (HTTP {response.status_code}): {detail}"
-                )
+                pages += 1
 
-            data = response.json()
-            messages = data.get("value", [])
+                if response.status_code != 200:
+                    try:
+                        detail = response.json()
+                    except Exception:
+                        detail = response.text
+                    logger.warning(
+                        "Microsoft Graph mail scan failed for %s (HTTP %s): %s",
+                        next_url,
+                        response.status_code,
+                        detail,
+                    )
+                    if url_index == 0:
+                        break
+                    raise RuntimeError(
+                        f"Microsoft Graph mailbox read failed (HTTP {response.status_code}): {detail}"
+                    )
 
-            for message in messages:
-                message_id = message.get("id")
-                if not message_id or message_id in seen_ids:
-                    continue
-                seen_ids.add(message_id)
+                data = response.json()
+                messages = data.get("value", [])
 
-                sender = _graph_address(message.get("from") or {})
+                for message in messages:
+                    message_id = message.get("id")
+                    if not message_id or message_id in seen_ids:
+                        continue
+                    seen_ids.add(message_id)
 
-                # IMPORTANT: /me/messages also contains our own Sent Items.
-                # Never expose those to reply matching as incoming replies.
-                if own_sender and _normalize_email_address(sender) == own_sender:
-                    logger.debug("Skipping own outgoing Graph message %s", message_id)
-                    continue
+                    sender = _graph_address(message.get("from") or {})
+                    if own_sender and _normalize_email_address(sender) == own_sender:
+                        continue
 
-                body = message.get("body") or {}
-                body_type = (body.get("contentType") or "").lower()
-                body_content = body.get("content") or ""
-                reply_text = (
-                    _html_to_text(body_content)
-                    if body_type == "html"
-                    else body_content.strip()
-                )
+                    body = message.get("body") or {}
+                    body_type = (body.get("contentType") or "").lower()
+                    body_content = body.get("content") or ""
+                    reply_text = (
+                        _html_to_text(body_content)
+                        if body_type == "html"
+                        else body_content.strip()
+                    )
 
-                recipients = [
-                    _graph_address(x)
-                    for x in (message.get("toRecipients") or [])
-                ]
+                    recipients = [
+                        _graph_address(x)
+                        for x in (message.get("toRecipients") or [])
+                    ]
 
-                output.append({
-                    "id": message_id,
-                    "thread_id": message.get("conversationId"),
-                    "from": sender,
-                    "to": ", ".join(x for x in recipients if x),
-                    "subject": message.get("subject") or "",
-                    "date": message.get("receivedDateTime") or "",
-                    "body": body_content,
-                    "body_type": body_type,
-                    "reply_text": reply_text,
-                    "has_attachments": bool(message.get("hasAttachments")),
-                    "parent_folder_id": message.get("parentFolderId"),
-                })
+                    headers_map = {}
+                    for h in message.get("internetMessageHeaders") or []:
+                        name = (h.get("name") or "").lower().strip()
+                        if name:
+                            headers_map[name] = h.get("value") or ""
+
+                    output.append({
+                        "id": message_id,
+                        "thread_id": message.get("conversationId"),
+                        "internet_message_id": message.get("internetMessageId"),
+                        "in_reply_to": headers_map.get("in-reply-to", ""),
+                        "references": headers_map.get("references", ""),
+                        "from": sender,
+                        "to": ", ".join(x for x in recipients if x),
+                        "subject": message.get("subject") or "",
+                        "date": message.get("receivedDateTime") or "",
+                        "body": body_content,
+                        "body_type": body_type,
+                        "reply_text": reply_text,
+                        "has_attachments": bool(message.get("hasAttachments")),
+                        "parent_folder_id": message.get("parentFolderId"),
+                    })
+
+                next_url = data.get("@odata.nextLink")
+                params = None
+
+                if not messages or not next_url:
+                    break
 
     output.sort(key=lambda item: item.get("date") or "", reverse=True)
-    return output[:top]
+    return output[:limit]
 
 
 async def get_message_attachments(message_id: str) -> list[dict]:
