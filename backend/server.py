@@ -1701,6 +1701,8 @@ async def list_replies(
                 "filename": a.get("filename"),
                 "mime_type": a.get("mime_type"),
                 "size": a.get("size", 0),
+                "share_token": _attachment_share_token(a.get("file_id"))
+                if a.get("file_id") else None,
             }
             for a in reply.get("attachments", [])
         ]
@@ -1708,26 +1710,41 @@ async def list_replies(
     return replies
 
 
-def _attachment_share_token(file_id: str, expires_days: int = 7) -> str:
-    """Create a short-lived signed URL token so Excel hyperlinks can open files without app login."""
-    payload = {
-        "file_id": file_id,
-        "exp": int((datetime.now(timezone.utc) + timedelta(days=expires_days)).timestamp()),
-    }
-    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+def _attachment_share_token(file_id: str) -> str:
+    """
+    Create a permanent signed attachment token.
+
+    There is intentionally NO expiry timestamp.
+    The token remains valid as long as the underlying GridFS file exists.
+    """
+    encoded = file_id.encode("utf-8").hex()
     secret = os.environ.get("JWT_SECRET") or os.environ.get("SECRET_KEY") or "attachment-link-secret"
-    encoded = base64.urlsafe_b64encode(raw).decode().rstrip("=")
-    sig = hmac.new(secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+    sig = hmac.new(
+        secret.encode("utf-8"),
+        encoded.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
     return f"{encoded}.{sig}"
 
 
 def _verify_attachment_share_token(token: str, file_id: str) -> bool:
+    """Verify a permanent attachment token. No expiry is checked."""
     try:
         encoded, sig = token.split(".", 1)
         secret = os.environ.get("JWT_SECRET") or os.environ.get("SECRET_KEY") or "attachment-link-secret"
-        expected = hmac.new(secret.encode("utf-8"), encoded.encode("utf-8"), hashlib.sha256).hexdigest()
+        expected = hmac.new(
+            secret.encode("utf-8"),
+            encoded.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+
         if not hmac.compare_digest(sig, expected):
             return False
+
+        decoded_file_id = bytes.fromhex(encoded).decode("utf-8")
+        return decoded_file_id == file_id
+    except Exception:
+        return False
         padded = encoded + "=" * (-len(encoded) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded.encode("utf-8")))
         return payload.get("file_id") == file_id and int(payload.get("exp", 0)) >= int(datetime.now(timezone.utc).timestamp())
@@ -1740,11 +1757,10 @@ async def download_reply_attachment(
     file_id: str,
     token: Optional[str] = Query(None),
 ):
-    # This endpoint is intentionally public because Excel/browser hyperlinks do not
-    # send the app Authorization header. Access is granted only with a signed,
-    # short-lived token generated during the authenticated Excel export.
+    # Attachment links are permanent. There is NO expiry check.
+    # The link remains usable until the underlying GridFS file is deleted.
     if not (token and _verify_attachment_share_token(token, file_id)):
-        raise HTTPException(status_code=401, detail="Invalid or expired attachment link")
+        raise HTTPException(status_code=401, detail="Invalid attachment link")
     try:
         object_id = ObjectId(file_id)
     except Exception:
