@@ -601,81 +601,107 @@ async def find_incoming_replies(
     after_message_id: str | None = None,
     max_results: int = 50,
 ) -> _ReplyScan:
-    """Read recent messages from the Microsoft 365 Inbox.
+    """Find recent incoming mail anywhere in the Microsoft mailbox.
 
-    ``start_history_id`` is accepted for compatibility with the existing
-    server sync loop. Microsoft Graph does not use Gmail history IDs here,
-    so this implementation scans the most recent Inbox messages and relies
-    on ``email_replies.message_id`` de-duplication in server.py.
-
-    The returned object behaves both like a list (older server code) and like
-    ``{"messages": [...], "history_id": None}`` (newer server code).
+    Microsoft Graph does not use Gmail history IDs.  We therefore scan the
+    mailbox-level ``/me/messages`` collection instead of only the Inbox.
+    This is important for replies that Outlook places outside the Inbox or
+    that are not among the newest Inbox messages.
     """
     del start_history_id
     del after_message_id
+
     access_token = _get_microsoft_access_token()
     top = max(1, min(int(max_results or 50), 100))
+    select = (
+        "id,conversationId,internetMessageId,subject,from,toRecipients,"
+        "receivedDateTime,body,hasAttachments,parentFolderId"
+    )
 
-    params = {
-        "$top": str(top),
-        "$orderby": "receivedDateTime desc",
-        "$select": (
-            "id,conversationId,internetMessageId,subject,from,toRecipients,"
-            "receivedDateTime,body,hasAttachments"
-        ),
-    }
+    headers = _graph_headers(access_token)
+    urls = [
+        "https://graph.microsoft.com/v1.0/me/messages",
+        "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
+    ]
 
-    url = "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages"
-
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            url,
-            headers=_graph_headers(access_token),
-            params=params,
-        )
-
-    if response.status_code != 200:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        raise RuntimeError(
-            f"Microsoft Graph inbox read failed (HTTP {response.status_code}): {detail}"
-        )
-
-    data = response.json()
+    seen_ids: set[str] = set()
     output = _ReplyScan()
 
-    for message in data.get("value", []):
-        body = message.get("body") or {}
-        body_type = (body.get("contentType") or "").lower()
-        body_content = body.get("content") or ""
-        reply_text = (
-            _html_to_text(body_content)
-            if body_type == "html"
-            else body_content.strip()
-        )
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        for url_index, url in enumerate(urls):
+            params = {
+                "$top": str(top),
+                "$orderby": "receivedDateTime desc",
+                "$select": select,
+            }
 
-        sender = _graph_address(message.get("from") or {})
-        recipients = [
-            _graph_address(x)
-            for x in (message.get("toRecipients") or [])
-        ]
+            response = await client.get(url, headers=headers, params=params)
 
-        output.append({
-            "id": message.get("id"),
-            "thread_id": message.get("conversationId"),
-            "from": sender,
-            "to": ", ".join(x for x in recipients if x),
-            "subject": message.get("subject") or "",
-            "date": message.get("receivedDateTime") or "",
-            "body": body_content,
-            "body_type": body_type,
-            "reply_text": reply_text,
-            "has_attachments": bool(message.get("hasAttachments")),
-        })
+            if response.status_code != 200:
+                try:
+                    detail = response.json()
+                except Exception:
+                    detail = response.text
+                logger.warning(
+                    "Microsoft Graph mail scan failed for %s (HTTP %s): %s",
+                    url,
+                    response.status_code,
+                    detail,
+                )
+                if url_index == 0:
+                    # Keep the Inbox fallback for tenants where mailbox-level
+                    # message listing is restricted.
+                    continue
+                raise RuntimeError(
+                    f"Microsoft Graph inbox read failed (HTTP {response.status_code}): {detail}"
+                )
 
-    return output
+            data = response.json()
+            messages = data.get("value", [])
+
+            for message in messages:
+                message_id = message.get("id")
+                if not message_id or message_id in seen_ids:
+                    continue
+                seen_ids.add(message_id)
+
+                body = message.get("body") or {}
+                body_type = (body.get("contentType") or "").lower()
+                body_content = body.get("content") or ""
+                reply_text = (
+                    _html_to_text(body_content)
+                    if body_type == "html"
+                    else body_content.strip()
+                )
+
+                sender = _graph_address(message.get("from") or {})
+                recipients = [
+                    _graph_address(x)
+                    for x in (message.get("toRecipients") or [])
+                ]
+
+                output.append({
+                    "id": message_id,
+                    "thread_id": message.get("conversationId"),
+                    "from": sender,
+                    "to": ", ".join(x for x in recipients if x),
+                    "subject": message.get("subject") or "",
+                    "date": message.get("receivedDateTime") or "",
+                    "body": body_content,
+                    "body_type": body_type,
+                    "reply_text": reply_text,
+                    "has_attachments": bool(message.get("hasAttachments")),
+                    "parent_folder_id": message.get("parentFolderId"),
+                })
+
+            # The mailbox-level result is the broad scan we need.  The Inbox
+            # call is only a fallback/extra source; no need to fetch more than
+            # these recent messages on every sync.
+            if output:
+                break
+
+    output.sort(key=lambda item: item.get("date") or "", reverse=True)
+    return output[:top]
 
 
 async def get_message_attachments(message_id: str) -> list[dict]:
