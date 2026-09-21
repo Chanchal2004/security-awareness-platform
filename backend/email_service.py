@@ -584,13 +584,35 @@ def _graph_address(item: dict) -> str:
     ).strip()
 
 
+class _ReplyScan(list):
+    """List-compatible scan result that also supports the newer dict contract."""
+
+    def get(self, key, default=None):
+        if key == "messages":
+            return list(self)
+        if key == "history_id":
+            return None
+        return default
+
+
 async def find_incoming_replies(
     *,
+    start_history_id: str | None = None,
     after_message_id: str | None = None,
     max_results: int = 50,
-) -> list[dict]:
-    """Read recent messages from the Microsoft 365 Inbox."""
-    del after_message_id  # Kept for compatibility with existing callers.
+) -> _ReplyScan:
+    """Read recent messages from the Microsoft 365 Inbox.
+
+    ``start_history_id`` is accepted for compatibility with the existing
+    server sync loop. Microsoft Graph does not use Gmail history IDs here,
+    so this implementation scans the most recent Inbox messages and relies
+    on ``email_replies.message_id`` de-duplication in server.py.
+
+    The returned object behaves both like a list (older server code) and like
+    ``{"messages": [...], "history_id": None}`` (newer server code).
+    """
+    del start_history_id
+    del after_message_id
     access_token = _get_microsoft_access_token()
     top = max(1, min(int(max_results or 50), 100))
 
@@ -622,7 +644,7 @@ async def find_incoming_replies(
         )
 
     data = response.json()
-    output = []
+    output = _ReplyScan()
 
     for message in data.get("value", []):
         body = message.get("body") or {}
