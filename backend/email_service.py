@@ -577,6 +577,14 @@ def _graph_headers(access_token: str) -> dict:
     }
 
 
+def _normalize_email_address(value: str) -> str:
+    """Normalize email values coming from Graph/env, including escaped @."""
+    value = (value or "").strip().strip("<>").strip()
+    # Some Render/env copy-pastes can contain a literal backslash before @.
+    value = value.replace("\\@", "@")
+    return value.lower()
+
+
 def _graph_address(item: dict) -> str:
     return (
         ((item or {}).get("emailAddress") or {}).get("address")
@@ -601,12 +609,12 @@ async def find_incoming_replies(
     after_message_id: str | None = None,
     max_results: int = 50,
 ) -> _ReplyScan:
-    """Find recent incoming mail anywhere in the Microsoft mailbox.
+    """Find incoming mail that can be a reply to a sent simulation.
 
-    Microsoft Graph does not use Gmail history IDs.  We therefore scan the
-    mailbox-level ``/me/messages`` collection instead of only the Inbox.
-    This is important for replies that Outlook places outside the Inbox or
-    that are not among the newest Inbox messages.
+    Microsoft Graph does not use Gmail history IDs.  We therefore scan both
+    Inbox and the mailbox message collection.  Messages sent by our own
+    Microsoft sender are explicitly ignored so the sync never treats our
+    outgoing Graph emails as incoming replies.
     """
     del start_history_id
     del after_message_id
@@ -619,13 +627,19 @@ async def find_incoming_replies(
     )
 
     headers = _graph_headers(access_token)
+    # Inbox first: this is where an actual Gmail/recipient reply should land.
+    # Mailbox-wide scan is kept as a fallback for messages Graph exposes outside
+    # the Inbox.  We collect from both instead of stopping after the first
+    # non-empty result, because the newest mailbox messages can be our own sent
+    # messages and otherwise hide an older incoming reply.
     urls = [
-        "https://graph.microsoft.com/v1.0/me/messages",
         "https://graph.microsoft.com/v1.0/me/mailFolders/inbox/messages",
+        "https://graph.microsoft.com/v1.0/me/messages",
     ]
 
     seen_ids: set[str] = set()
     output = _ReplyScan()
+    own_sender = _normalize_email_address(MICROSOFT_SENDER_EMAIL)
 
     async with httpx.AsyncClient(timeout=30.0) as client:
         for url_index, url in enumerate(urls):
@@ -649,11 +663,10 @@ async def find_incoming_replies(
                     detail,
                 )
                 if url_index == 0:
-                    # Keep the Inbox fallback for tenants where mailbox-level
-                    # message listing is restricted.
+                    # Continue with mailbox-wide scan if Inbox access fails.
                     continue
                 raise RuntimeError(
-                    f"Microsoft Graph inbox read failed (HTTP {response.status_code}): {detail}"
+                    f"Microsoft Graph mailbox read failed (HTTP {response.status_code}): {detail}"
                 )
 
             data = response.json()
@@ -665,6 +678,14 @@ async def find_incoming_replies(
                     continue
                 seen_ids.add(message_id)
 
+                sender = _graph_address(message.get("from") or {})
+
+                # IMPORTANT: /me/messages also contains our own Sent Items.
+                # Never expose those to reply matching as incoming replies.
+                if own_sender and _normalize_email_address(sender) == own_sender:
+                    logger.debug("Skipping own outgoing Graph message %s", message_id)
+                    continue
+
                 body = message.get("body") or {}
                 body_type = (body.get("contentType") or "").lower()
                 body_content = body.get("content") or ""
@@ -674,7 +695,6 @@ async def find_incoming_replies(
                     else body_content.strip()
                 )
 
-                sender = _graph_address(message.get("from") or {})
                 recipients = [
                     _graph_address(x)
                     for x in (message.get("toRecipients") or [])
@@ -693,12 +713,6 @@ async def find_incoming_replies(
                     "has_attachments": bool(message.get("hasAttachments")),
                     "parent_folder_id": message.get("parentFolderId"),
                 })
-
-            # The mailbox-level result is the broad scan we need.  The Inbox
-            # call is only a fallback/extra source; no need to fetch more than
-            # these recent messages on every sync.
-            if output:
-                break
 
     output.sort(key=lambda item: item.get("date") or "", reverse=True)
     return output[:top]
