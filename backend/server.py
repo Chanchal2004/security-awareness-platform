@@ -1029,6 +1029,7 @@ async def send_simulation(sid: str, user: dict = Depends(get_current_user)):
             "last_activity": ts,
             "sent_message_id": (sent_result or {}).get("id") if live else None,
             "thread_id": (sent_result or {}).get("thread_id") if live else None,
+            "internet_message_id": (sent_result or {}).get("internet_message_id") if live else None,
             "reply_received": False,
             "reply_text": "",
             "reply_received_at": None,
@@ -1459,7 +1460,7 @@ def _normalize_subject(value: str) -> str:
 
 
 async def _sync_incoming_replies(*, force: bool = False) -> dict:
-    """Incrementally sync Gmail replies without repeatedly scanning the inbox."""
+    """Sync Microsoft Graph replies and attachments into MongoDB/GridFS."""
     global _last_reply_sync_at
 
     now = asyncio.get_running_loop().time()
@@ -1499,7 +1500,7 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
         try:
             scan = await find_incoming_replies(
                 start_history_id=start_history_id,
-                max_results=30,
+                max_results=500,
             )
         except Exception as exc:
             # Do not turn a temporary Gmail quota/rate-limit condition into a
@@ -1550,23 +1551,47 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
 
             sender_email = _email_from_header(item.get("from", ""))
             incoming_subject = _normalize_subject(item.get("subject", ""))
+            incoming_in_reply_to = (item.get("in_reply_to") or "").strip().lower()
+            incoming_references = (item.get("references") or "").lower()
+
+            # 1) Best match: exact Graph conversation/thread + sender.
             candidates = by_thread.get(thread_id, []) if thread_id else []
             candidate = next(
-                (row for row in candidates if row.get("email", "").lower().strip() == sender_email),
+                (
+                    row for row in candidates
+                    if _email_from_header(row.get("email", "")) == sender_email
+                ),
                 None,
             )
 
+            # 2) Strong match: Internet Message-ID from our sent message
+            # appears in In-Reply-To or References.
+            if not candidate and (incoming_in_reply_to or incoming_references):
+                for row in sent_rows:
+                    original_id = (row.get("internet_message_id") or "").strip().lower()
+                    if not original_id:
+                        continue
+                    if original_id == incoming_in_reply_to or original_id in incoming_references:
+                        if _email_from_header(row.get("email", "")) == sender_email:
+                            candidate = row
+                            break
+
+            # 3) Sender + normalized subject.
             if not candidate:
                 fallback = [
                     row for row in sent_by_sender.get(sender_email, [])
                     if _normalize_subject(row.get("subject", "")) == incoming_subject
                 ]
-                # If the employee changed the subject or the mail client did
-                # not preserve the original thread, attach the reply to the
-                # most recently sent simulation for that employee. This also
-                # handles repeated tests to the same address.
-                if not fallback:
-                    fallback = list(sent_by_sender.get(sender_email, []))
+                fallback.sort(
+                    key=lambda row: (row.get("last_activity") or row.get("sent_at") or ""),
+                    reverse=True,
+                )
+                candidate = fallback[0] if fallback else None
+
+            # 4) Last resort: sender only, most recently sent simulation.
+            # This handles mail clients that rewrite the subject/thread headers.
+            if not candidate:
+                fallback = list(sent_by_sender.get(sender_email, []))
                 fallback.sort(
                     key=lambda row: (row.get("last_activity") or row.get("sent_at") or ""),
                     reverse=True,
@@ -1675,7 +1700,7 @@ async def sync_replies(user: dict = Depends(get_current_user)):
         logger.exception("Reply sync failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Could not sync Gmail replies: {exc}",
+            detail=f"Could not sync Outlook/Microsoft replies: {exc}",
         )
     await log_audit(
         user["email"],
@@ -1833,7 +1858,7 @@ async def _reply_sync_loop():
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Background Gmail reply sync failed")
+            logger.exception("Background Microsoft Graph reply sync failed")
         await asyncio.sleep(900)
 
 
