@@ -1516,8 +1516,15 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                 }
             raise
 
-        incoming = scan.get("messages", [])
-        history_id = scan.get("history_id")
+        # email_service.find_incoming_replies() returns a list-compatible
+        # scan result. Support both the list contract and the newer dict
+        # contract so reply sync never crashes on scan.get().
+        if isinstance(scan, list):
+            incoming = list(scan)
+            history_id = None
+        else:
+            incoming = scan.get("messages", [])
+            history_id = scan.get("history_id")
 
         by_thread = {}
         for row in sent_rows:
@@ -1752,14 +1759,34 @@ def _verify_attachment_share_token(token: str, file_id: str) -> bool:
         return False
 
 
+async def _attachment_request_is_authorized(
+    request: Request,
+    file_id: str,
+    token: Optional[str],
+) -> bool:
+    # Excel/exported links use the permanent signed share token.
+    if token and _verify_attachment_share_token(token, file_id):
+        return True
+
+    # Dashboard requests already carry the normal TALBROS access cookie or
+    # Bearer token. Accept that authenticated session too, so the Reports
+    # page does not need to expose a separate token in its API request.
+    try:
+        await get_current_user(request)
+        return True
+    except HTTPException:
+        return False
+
+
 @api.get("/replies/attachments/{file_id}")
 async def download_reply_attachment(
     file_id: str,
+    request: Request,
     token: Optional[str] = Query(None),
 ):
     # Attachment links are permanent. There is NO expiry check.
     # The link remains usable until the underlying GridFS file is deleted.
-    if not (token and _verify_attachment_share_token(token, file_id)):
+    if not await _attachment_request_is_authorized(request, file_id, token):
         raise HTTPException(status_code=401, detail="Invalid attachment link")
     try:
         object_id = ObjectId(file_id)
