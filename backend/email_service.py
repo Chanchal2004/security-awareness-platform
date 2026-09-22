@@ -6,6 +6,7 @@ import json
 import base64
 import asyncio
 import imaplib
+import threading
 from email import policy
 from email.parser import BytesParser
 from email.utils import parseaddr, parsedate_to_datetime
@@ -26,6 +27,10 @@ from googleapiclient.discovery import build
 
 
 logger = logging.getLogger(__name__)
+
+# Reuse one authenticated Zoho IMAP connection between polls.
+_ZOHO_MAILBOX = None
+_ZOHO_MAILBOX_LOCK = threading.Lock()
 
 
 # ============================================================
@@ -647,17 +652,36 @@ def _iso_date(value: str | None) -> str:
 
 
 def _zoho_open() -> imaplib.IMAP4_SSL:
-    """Open the Zoho IMAP inbox with an app password."""
+    """Return a reusable Zoho IMAP connection, reconnecting when needed."""
+    global _ZOHO_MAILBOX
+
     if not _zoho_ready():
         raise RuntimeError(
             "Zoho IMAP is not configured. Set ZOHO_IMAP_EMAIL and "
             "ZOHO_IMAP_PASSWORD in Render Environment Variables."
         )
 
-    mailbox = imaplib.IMAP4_SSL(
-        ZOHO_IMAP_HOST,
-        ZOHO_IMAP_PORT,
-    )
+    with _ZOHO_MAILBOX_LOCK:
+        if _ZOHO_MAILBOX is not None:
+            try:
+                status, _ = _ZOHO_MAILBOX.noop()
+                if status == "OK":
+                    status, _ = _ZOHO_MAILBOX.select(
+                        ZOHO_IMAP_FOLDER, readonly=True
+                    )
+                    if status == "OK":
+                        return _ZOHO_MAILBOX
+            except Exception:
+                try:
+                    _ZOHO_MAILBOX.logout()
+                except Exception:
+                    pass
+                _ZOHO_MAILBOX = None
+
+        mailbox = imaplib.IMAP4_SSL(
+            ZOHO_IMAP_HOST,
+            ZOHO_IMAP_PORT,
+        )
     # Render copy/paste can accidentally leave a literal \@ in the email.
     # Zoho app passwords are shown grouped with spaces; IMAP expects the
     # actual password without those display spaces.
@@ -701,6 +725,7 @@ def _zoho_open() -> imaplib.IMAP4_SSL:
             f"Could not select Zoho IMAP folder {ZOHO_IMAP_FOLDER!r}."
         )
 
+    _ZOHO_MAILBOX = mailbox
     return mailbox
 
 
@@ -845,10 +870,8 @@ def _zoho_find_incoming_sync(limit: int, after_uid: int | None = None) -> _Reply
         results.last_uid = scanned_last_uid
         return results
     finally:
-        try: mailbox.close()
-        except Exception: pass
-        try: mailbox.logout()
-        except Exception: pass
+        # Keep the authenticated IMAP session alive for the next poll.
+        pass
 
 
 async def find_incoming_replies(
