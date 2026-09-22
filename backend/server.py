@@ -1364,7 +1364,7 @@ def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 # ---------------------------------------------------------------------------
 
 MAX_REPLY_ATTACHMENT_BYTES = 25 * 1024 * 1024
-REPLY_SYNC_INTERVAL_SECONDS = 1
+REPLY_SYNC_INTERVAL_SECONDS = 0.5
 REPLY_SYNC_LOCK = asyncio.Lock()
 _last_reply_sync_at = 0.0
 
@@ -1610,7 +1610,14 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                 continue
 
             matched += 1
-            details = await get_incoming_message_details(message_id)
+            # Zoho scans already contain the full parsed message (body + attachments).
+            # Re-fetching the same message opened a second IMAP connection and added
+            # avoidable seconds to reply sync. Only use the detail fetch for non-Zoho
+            # messages (e.g. the Graph fallback).
+            if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
+                details = item
+            else:
+                details = await get_incoming_message_details(message_id)
             attachments = []
             total_size = 0
             for attachment in details.get("attachments", []):
@@ -1865,7 +1872,7 @@ async def _reply_sync_loop():
             raise
         except Exception:
             logger.exception("Background incoming email reply sync failed")
-        await asyncio.sleep(2)
+        await asyncio.sleep(0.5)
 
 
 @api.get("/reports/recipient-data")
