@@ -1,9 +1,3 @@
-import os
-import re
-import ipaddress
-import logging
-import json
-import base64
 
 import msal
 import httpx
@@ -58,6 +52,28 @@ MICROSOFT_SENDER_EMAIL = os.environ.get(
 )
 MICROSOFT_TOKEN_CACHE = os.environ.get("MICROSOFT_TOKEN_CACHE")
 MICROSOFT_SCOPES = ["Mail.Send", "Mail.ReadWrite"]
+
+
+# ============================================================
+# ZOHO IMAP INCOMING REPLY CONFIG
+# ============================================================
+# Incoming mail for qhtalbros.com is being delivered to Zoho.
+# We therefore read replies/attachments from the Zoho mailbox via IMAP.
+# Microsoft Graph remains the outbound sender.
+
+ZOHO_IMAP_HOST = os.environ.get("ZOHO_IMAP_HOST", "imap.zoho.com")
+ZOHO_IMAP_PORT = int(os.environ.get("ZOHO_IMAP_PORT", "993"))
+ZOHO_IMAP_EMAIL = os.environ.get("ZOHO_IMAP_EMAIL", "").strip()
+ZOHO_IMAP_PASSWORD = os.environ.get("ZOHO_IMAP_PASSWORD", "")
+ZOHO_IMAP_FOLDER = os.environ.get("ZOHO_IMAP_FOLDER", "INBOX")
+
+# When Zoho IMAP is configured, force replies to the same Zoho mailbox.
+# Otherwise fall back to EMAIL_REPLY_TO / Microsoft sender.
+INBOUND_REPLY_EMAIL = (
+    ZOHO_IMAP_EMAIL
+    or EMAIL_REPLY_TO
+    or MICROSOFT_SENDER_EMAIL
+)
 
 
 # Keep the MSAL cache in memory for the lifetime of the Render process.
@@ -445,23 +461,13 @@ def _get_microsoft_msal_app():
 def _get_microsoft_access_token() -> str:
     app = _get_microsoft_msal_app()
 
-    # Strictly use the configured Microsoft mailbox.
-    # Do NOT fall back to another cached account: doing so can silently
-    # send/read mail from the wrong Outlook account.
-    accounts = app.get_accounts(
-        username=MICROSOFT_SENDER_EMAIL
-    )
+    accounts = app.get_accounts(username=MICROSOFT_SENDER_EMAIL)
 
     if not accounts:
-        cached_users = [
-            str(account.get("username") or "")
-            for account in app.get_accounts()
-        ]
         raise RuntimeError(
-            f"No Microsoft account found for {MICROSOFT_SENDER_EMAIL!r} "
-            f"in MICROSOFT_TOKEN_CACHE. Cached accounts: {cached_users}. "
-            "Generate a fresh MSAL cache using the same mailbox and paste the "
-            "complete cache JSON into Render."
+            "No Microsoft login account was found in MICROSOFT_TOKEN_CACHE. "
+            "Run the local Microsoft login/token-cache generator again and copy the "
+            "complete MSAL cache JSON into Render."
         )
 
     result = app.acquire_token_silent(
@@ -496,7 +502,7 @@ async def send_email(
 ) -> dict:
     """Create and send a Microsoft Graph message and return its IDs."""
     assert_safe_email(subject, html)
-    final_reply_to = reply_to or EMAIL_REPLY_TO
+    final_reply_to = reply_to or INBOUND_REPLY_EMAIL
     access_token = _get_microsoft_access_token()
 
     message = {
@@ -531,6 +537,7 @@ async def send_email(
         created = create_response.json()
         message_id = created.get("id")
         conversation_id = created.get("conversationId")
+        internet_message_id = created.get("internetMessageId")
         if not message_id:
             raise RuntimeError("Microsoft Graph did not return a message ID.")
 
@@ -551,7 +558,11 @@ async def send_email(
         "Email sent via Microsoft Graph to %s from %s (message=%s, conversation=%s)",
         to, MICROSOFT_SENDER_EMAIL, message_id, conversation_id,
     )
-    return {"id": message_id, "thread_id": conversation_id}
+    return {
+        "id": message_id,
+        "thread_id": conversation_id,
+        "internet_message_id": internet_message_id,
+    }
 
 
 # ============================================================
@@ -601,7 +612,7 @@ def _graph_address(item: dict) -> str:
 
 
 class _ReplyScan(list):
-    """List-compatible scan result that also supports the newer dict contract."""
+    """List-compatible reply scan result used by server.py."""
 
     def get(self, key, default=None):
         if key == "messages":
@@ -611,28 +622,292 @@ class _ReplyScan(list):
         return default
 
 
+def _zoho_ready() -> bool:
+    return bool(ZOHO_IMAP_EMAIL and ZOHO_IMAP_PASSWORD)
+
+
+def _decode_mime_header(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        return str(make_header(decode_header(value)))
+    except Exception:
+        return value
+
+
+def _iso_date(value: str | None) -> str:
+    if not value:
+        return ""
+    try:
+        dt = parsedate_to_datetime(value)
+        if dt is None:
+            return ""
+        return dt.isoformat()
+    except Exception:
+        return value
+
+
+def _zoho_open() -> imaplib.IMAP4_SSL:
+    """Open the Zoho IMAP inbox with an app password."""
+    if not _zoho_ready():
+        raise RuntimeError(
+            "Zoho IMAP is not configured. Set ZOHO_IMAP_EMAIL and "
+            "ZOHO_IMAP_PASSWORD in Render Environment Variables."
+        )
+
+    mailbox = imaplib.IMAP4_SSL(
+        ZOHO_IMAP_HOST,
+        ZOHO_IMAP_PORT,
+    )
+    try:
+        status, data = mailbox.login(
+            ZOHO_IMAP_EMAIL,
+            ZOHO_IMAP_PASSWORD,
+        )
+    except Exception:
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+        raise
+
+    if status != "OK":
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+        raise RuntimeError(f"Zoho IMAP login failed: {data!r}")
+
+    status, _ = mailbox.select(
+        ZOHO_IMAP_FOLDER,
+        readonly=True,
+    )
+    if status != "OK":
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+        raise RuntimeError(
+            f"Could not select Zoho IMAP folder {ZOHO_IMAP_FOLDER!r}."
+        )
+
+    return mailbox
+
+
+def _message_text_and_attachments(msg):
+    """Extract readable body text and file attachments from an EmailMessage."""
+    plain_parts: list[str] = []
+    html_parts: list[str] = []
+    attachments: list[dict] = []
+
+    if msg.is_multipart():
+        parts = msg.walk()
+    else:
+        parts = [msg]
+
+    for part in parts:
+        if part.is_multipart():
+            continue
+
+        filename = part.get_filename()
+        disposition = (part.get_content_disposition() or "").lower()
+        content_type = (part.get_content_type() or "").lower()
+
+        # Any named attachment is a real file attachment.
+        if filename or disposition == "attachment":
+            if not filename:
+                filename = "attachment"
+            try:
+                payload = part.get_payload(decode=True) or b""
+            except Exception:
+                payload = b""
+            if payload:
+                attachments.append({
+                    "filename": _decode_mime_header(filename),
+                    "mime_type": content_type or "application/octet-stream",
+                    "data": payload,
+                    "size": len(payload),
+                })
+            continue
+
+        # Ignore inline images/binaries for the dashboard attachment count.
+        if content_type.startswith("image/") and disposition == "inline":
+            continue
+
+        try:
+            value = part.get_content()
+        except Exception:
+            raw = part.get_payload(decode=True) or b""
+            charset = part.get_content_charset() or "utf-8"
+            try:
+                value = raw.decode(charset, errors="replace")
+            except Exception:
+                value = raw.decode("utf-8", errors="replace")
+
+        if not isinstance(value, str):
+            continue
+
+        if content_type == "text/plain":
+            plain_parts.append(value)
+        elif content_type == "text/html":
+            html_parts.append(value)
+
+    if plain_parts:
+        body = "\n\n".join(x.strip() for x in plain_parts if x.strip())
+    elif html_parts:
+        body = _html_to_text("\n\n".join(html_parts))
+    else:
+        body = ""
+
+    return body, attachments
+
+
+def _zoho_fetch_uid_sync(uid: bytes | str) -> dict:
+    mailbox = _zoho_open()
+    try:
+        uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+        status, data = mailbox.uid(
+            "fetch",
+            uid_text,
+            "(BODY.PEEK[])"
+        )
+        if status != "OK":
+            raise RuntimeError(
+                f"Zoho IMAP fetch failed for UID {uid_text}: {data!r}"
+            )
+
+        raw_message = None
+        for item in data or []:
+            if isinstance(item, tuple) and len(item) >= 2:
+                raw_message = item[1]
+                break
+
+        if not raw_message:
+            raise RuntimeError(
+                f"Zoho IMAP returned no message data for UID {uid_text}."
+            )
+
+        msg = BytesParser(policy=policy.default).parsebytes(raw_message)
+
+        sender = parseaddr(msg.get("From", ""))[1].strip().lower()
+        to_values = [
+            parseaddr(x)[1].strip().lower()
+            for x in msg.get_all("To", [])
+            if parseaddr(x)[1]
+        ]
+
+        body, attachments = _message_text_and_attachments(msg)
+
+        # UID is stable within the mailbox and avoids collisions with Graph IDs.
+        message_id = (msg.get("Message-ID") or "").strip()
+        stable_id = (
+            f"zoho:{message_id}"
+            if message_id
+            else f"zoho-uid:{uid_text}"
+        )
+
+        return {
+            "id": stable_id,
+            "uid": uid_text,
+            "thread_id": None,
+            "internet_message_id": message_id or None,
+            "in_reply_to": (msg.get("In-Reply-To") or "").strip().lower(),
+            "references": (msg.get("References") or "").strip().lower(),
+            "from": sender,
+            "to": ", ".join(x for x in to_values if x),
+            "subject": _decode_mime_header(msg.get("Subject", "")),
+            "date": _iso_date(msg.get("Date", "")),
+            "body": body,
+            "body_type": "text/plain",
+            "reply_text": body,
+            "has_attachments": bool(attachments),
+            "parent_folder_id": ZOHO_IMAP_FOLDER,
+            "attachments": attachments,
+        }
+    finally:
+        try:
+            mailbox.close()
+        except Exception:
+            pass
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
+
+def _zoho_find_incoming_sync(limit: int) -> _ReplyScan:
+    mailbox = _zoho_open()
+    try:
+        status, data = mailbox.uid("search", None, "ALL")
+        if status != "OK":
+            raise RuntimeError(f"Zoho IMAP search failed: {data!r}")
+
+        raw_uids = (data[0] or b"").split()
+        raw_uids = raw_uids[-limit:]
+        results = _ReplyScan()
+
+        # Newest first. We fetch the most recent messages only.
+        for uid in reversed(raw_uids):
+            try:
+                item = _zoho_fetch_uid_sync(uid)
+            except Exception:
+                logger.exception(
+                    "Could not read Zoho message UID %s",
+                    uid.decode(errors="ignore") if isinstance(uid, bytes) else uid,
+                )
+                continue
+            results.append(item)
+
+        return results
+    finally:
+        try:
+            mailbox.close()
+        except Exception:
+            pass
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
+
 async def find_incoming_replies(
     *,
     start_history_id: str | None = None,
     after_message_id: str | None = None,
     max_results: int = 500,
 ) -> _ReplyScan:
-    """Find incoming Outlook/Graph messages that may be replies.
+    """Find replies from the mailbox that actually receives qhtalbros.com mail.
 
-    Microsoft Graph does not provide Gmail-style history IDs for this flow, so
-    we read the Inbox and (as a fallback) the mailbox message collection.
-    Pagination is followed so an older reply is not hidden behind the newest
-    messages. Outgoing messages from our own mailbox are always ignored.
+    The current domain mail is landing in Zoho, so Zoho IMAP is the primary
+    inbound source. Microsoft Graph remains the outbound sender. The Graph
+    fallback is retained only for installations where Zoho IMAP variables are
+    not configured.
     """
     del start_history_id
     del after_message_id
 
-    access_token = _get_microsoft_access_token()
     limit = max(1, min(int(max_results or 500), 500))
-    page_size = min(limit, 100)
+
+    if _zoho_ready():
+        logger.info(
+            "Checking Zoho IMAP inbox %s for incoming replies.",
+            ZOHO_IMAP_EMAIL,
+        )
+        result = await asyncio.to_thread(
+            _zoho_find_incoming_sync,
+            limit,
+        )
+        logger.info(
+            "Zoho IMAP incoming scan found %d message(s).",
+            len(result),
+        )
+        return result
+
+    # No Zoho credentials: preserve the Microsoft Graph path as a fallback.
+    access_token = _get_microsoft_access_token()
     select = (
         "id,conversationId,internetMessageId,subject,from,toRecipients,"
-        "receivedDateTime,body,hasAttachments,parentFolderId"
+        "receivedDateTime,body,hasAttachments,parentFolderId,internetMessageHeaders"
     )
 
     headers = _graph_headers(access_token)
@@ -649,17 +924,19 @@ async def find_incoming_replies(
         for url_index, url in enumerate(urls):
             next_url = url
             params = {
-                "$top": str(page_size),
+                "$top": "100",
                 "$orderby": "receivedDateTime desc",
                 "$select": select,
             }
+            pages = 0
 
-            while next_url and len(output) < limit:
+            while next_url and len(output) < limit and pages < 10:
                 response = await client.get(
                     next_url,
                     headers=headers,
                     params=params if next_url == url else None,
                 )
+                pages += 1
 
                 if response.status_code != 200:
                     try:
@@ -673,11 +950,9 @@ async def find_incoming_replies(
                         detail,
                     )
                     if url_index == 0:
-                        # Inbox failure: try mailbox-wide scan.
                         break
                     raise RuntimeError(
-                        f"Microsoft Graph mailbox read failed "
-                        f"(HTTP {response.status_code}): {detail}"
+                        f"Microsoft Graph mailbox read failed (HTTP {response.status_code}): {detail}"
                     )
 
                 data = response.json()
@@ -690,9 +965,6 @@ async def find_incoming_replies(
                     seen_ids.add(message_id)
 
                     sender = _graph_address(message.get("from") or {})
-
-                    # /me/messages includes Sent Items. Never treat our own
-                    # outbound email as an incoming reply.
                     if own_sender and _normalize_email_address(sender) == own_sender:
                         continue
 
@@ -710,10 +982,18 @@ async def find_incoming_replies(
                         for x in (message.get("toRecipients") or [])
                     ]
 
+                    headers_map = {}
+                    for h in message.get("internetMessageHeaders") or []:
+                        name = (h.get("name") or "").lower().strip()
+                        if name:
+                            headers_map[name] = h.get("value") or ""
+
                     output.append({
                         "id": message_id,
                         "thread_id": message.get("conversationId"),
                         "internet_message_id": message.get("internetMessageId"),
+                        "in_reply_to": headers_map.get("in-reply-to", ""),
+                        "references": headers_map.get("references", ""),
                         "from": sender,
                         "to": ", ".join(x for x in recipients if x),
                         "subject": message.get("subject") or "",
@@ -725,18 +1005,22 @@ async def find_incoming_replies(
                         "parent_folder_id": message.get("parentFolderId"),
                     })
 
-                    if len(output) >= limit:
-                        break
-
                 next_url = data.get("@odata.nextLink")
                 params = None
+
+                if not messages or not next_url:
+                    break
 
     output.sort(key=lambda item: item.get("date") or "", reverse=True)
     return output[:limit]
 
 
 async def get_message_attachments(message_id: str) -> list[dict]:
-    """Download file attachments from a Microsoft Graph message."""
+    """Download attachments for a reply message from Zoho or Graph."""
+    if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
+        details = await get_incoming_message_details(message_id)
+        return details.get("attachments", [])
+
     access_token = _get_microsoft_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/attachments"
 
@@ -758,8 +1042,7 @@ async def get_message_attachments(message_id: str) -> list[dict]:
 
     results = []
     for item in response.json().get("value", []):
-        odata_type = item.get("@odata.type", "")
-        if odata_type != "#microsoft.graph.fileAttachment":
+        if item.get("@odata.type", "") != "#microsoft.graph.fileAttachment":
             continue
 
         content_bytes = item.get("contentBytes")
@@ -774,10 +1057,6 @@ async def get_message_attachments(message_id: str) -> list[dict]:
                     headers=_graph_headers(access_token),
                 )
             if one.status_code != 200:
-                logger.warning(
-                    "Could not download Microsoft attachment %s from message %s: HTTP %s",
-                    filename, message_id, one.status_code,
-                )
                 continue
             item = one.json()
             content_bytes = item.get("contentBytes")
@@ -802,7 +1081,14 @@ async def get_message_attachments(message_id: str) -> list[dict]:
 
 
 async def get_incoming_message_details(message_id: str) -> dict:
-    """Get one Microsoft Graph message, body text and its file attachments."""
+    """Get one reply's body and attachments from Zoho or Graph."""
+    if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
+        uid_or_message_id = message_id
+        return await asyncio.to_thread(
+            _zoho_get_message_details_sync,
+            uid_or_message_id,
+        )
+
     access_token = _get_microsoft_access_token()
     url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}"
     params = {
@@ -849,12 +1135,49 @@ async def get_incoming_message_details(message_id: str) -> dict:
     ]
 
     return {
-        "message_id": message_id,
+        "id": message.get("id") or message_id,
         "thread_id": message.get("conversationId"),
+        "internet_message_id": message.get("internetMessageId"),
         "from": sender,
         "to": ", ".join(x for x in recipients if x),
         "subject": message.get("subject") or "",
         "date": message.get("receivedDateTime") or "",
+        "body": body_content,
+        "body_type": body_type,
         "reply_text": reply_text,
         "attachments": attachments,
     }
+
+
+def _zoho_get_message_details_sync(message_id: str) -> dict:
+    mailbox = _zoho_open()
+    try:
+        uid_text = None
+
+        if message_id.startswith("zoho-uid:"):
+            uid_text = message_id.split(":", 1)[1]
+        elif message_id.startswith("zoho:"):
+            # Resolve Message-ID back to its IMAP UID.
+            wanted = message_id.split(":", 1)[1]
+            status, data = mailbox.uid(
+                "search",
+                None,
+                'HEADER', 'Message-ID', wanted.strip('<>'),
+            )
+            if status != "OK" or not data or not data[0]:
+                raise RuntimeError(
+                    f"Could not find Zoho message {wanted!r} in INBOX."
+                )
+            uid_text = data[0].split()[-1].decode()
+
+        return _zoho_fetch_uid_sync(uid_text)
+    finally:
+        try:
+            mailbox.close()
+        except Exception:
+            pass
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
