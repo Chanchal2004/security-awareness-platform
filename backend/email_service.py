@@ -1226,7 +1226,7 @@ def _zoho_get_message_details_sync(message_id: str) -> dict:
                 )
             uid_text = data[0].split()[-1].decode()
 
-        return _zoho_fetch_uid_sync(uid_text)
+        return _zoho_fetch_uid_sync(mailbox, uid_text)
     finally:
         try:
             mailbox.close()
