@@ -1,3 +1,15 @@
+import os
+import re
+import ipaddress
+import logging
+import json
+import base64
+import asyncio
+import imaplib
+from email import policy
+from email.parser import BytesParser
+from email.utils import parseaddr, parsedate_to_datetime
+from email.header import decode_header, make_header
 
 import msal
 import httpx
