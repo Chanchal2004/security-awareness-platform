@@ -828,9 +828,20 @@ def _parse_zoho_message(uid_text: str, raw_message: bytes) -> dict:
     }
 
 
-def _zoho_fetch_uid_sync(mailbox, uid: bytes | str) -> dict:
+def _zoho_fetch_uid_sync(mailbox, uid: bytes | str, *, headers_only: bool = False) -> dict:
+    """Fetch one Zoho message. Header-only fetch is used during polling.
+
+    Full BODY.PEEK[] is intentionally reserved for a message that the server
+    has already matched to a sent simulation recipient. This avoids downloading
+    attachments for unrelated Microsoft security alerts and other inbox noise.
+    """
     uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
-    status, data = mailbox.uid("fetch", uid_text, "(BODY.PEEK[])")
+    fetch_spec = (
+        "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])"
+        if headers_only
+        else "(BODY.PEEK[])"
+    )
+    status, data = mailbox.uid("fetch", uid_text, fetch_spec)
     if status != "OK":
         raise RuntimeError(f"Zoho IMAP fetch failed for UID {uid_text}: {data!r}")
     raw_message = None
@@ -840,38 +851,77 @@ def _zoho_fetch_uid_sync(mailbox, uid: bytes | str) -> dict:
             break
     if not raw_message:
         raise RuntimeError(f"Zoho IMAP returned no message data for UID {uid_text}.")
+
+    msg = BytesParser(policy=policy.default).parsebytes(raw_message)
+    sender = parseaddr(msg.get("From", ""))[1].strip().lower()
+    to_values = [
+        parseaddr(x)[1].strip().lower()
+        for x in msg.get_all("To", [])
+        if parseaddr(x)[1]
+    ]
+    message_id = (msg.get("Message-ID") or "").strip()
+    stable_id = f"zoho:{message_id}" if message_id else f"zoho-uid:{uid_text}"
+
+    if headers_only:
+        return {
+            "id": stable_id,
+            "uid": uid_text,
+            "thread_id": None,
+            "internet_message_id": message_id or None,
+            "in_reply_to": (msg.get("In-Reply-To") or "").strip().lower(),
+            "references": (msg.get("References") or "").strip().lower(),
+            "from": sender,
+            "to": ", ".join(x for x in to_values if x),
+            "subject": _decode_mime_header(msg.get("Subject", "")),
+            "date": _iso_date(msg.get("Date", "")),
+            "body": "",
+            "body_type": "text/plain",
+            "reply_text": "",
+            "has_attachments": False,
+            "parent_folder_id": ZOHO_IMAP_FOLDER,
+            "attachments": [],
+        }
+
     return _parse_zoho_message(uid_text, raw_message)
 
 
 def _zoho_find_incoming_sync(limit: int, after_uid: int | None = None) -> _ReplyScan:
+    """Fast incremental Zoho scan: search UIDs, then download headers only."""
     mailbox = _zoho_open()
     try:
-        if after_uid:
-            criteria = f"UID {int(after_uid) + 1}:*"
-        else:
-            criteria = "ALL"
+        criteria = f"UID {int(after_uid) + 1}:*" if after_uid else "ALL"
         status, data = mailbox.uid("search", None, criteria)
         if status != "OK":
             raise RuntimeError(f"Zoho IMAP search failed: {data!r}")
+
         raw_uids = (data[0] or b"").split()
-        raw_uids = raw_uids[-max(1, min(int(limit), 100)):]
+        max_scan = max(1, min(int(limit), 100))
+        raw_uids = raw_uids[-max_scan:]
         results = _ReplyScan()
-        scanned_last_uid = after_uid or 0
+        scanned_last_uid = int(after_uid or 0)
+
         for uid in raw_uids:
             try:
-                item = _zoho_fetch_uid_sync(mailbox, uid)
+                item = _zoho_fetch_uid_sync(mailbox, uid, headers_only=True)
                 results.append(item)
-                try:
-                    scanned_last_uid = max(scanned_last_uid, int(item["uid"]))
-                except Exception:
-                    pass
+                scanned_last_uid = max(scanned_last_uid, int(item["uid"]))
             except Exception:
-                logger.exception("Could not read Zoho message UID %s", uid.decode(errors="ignore") if isinstance(uid, bytes) else uid)
+                logger.exception(
+                    "Could not read Zoho message UID %s",
+                    uid.decode(errors="ignore") if isinstance(uid, bytes) else uid,
+                )
+
         results.last_uid = scanned_last_uid
         return results
     finally:
-        # Keep the authenticated IMAP session alive for the next poll.
-        pass
+        try:
+            mailbox.close()
+        except Exception:
+            pass
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
 
 
 async def find_incoming_replies(
