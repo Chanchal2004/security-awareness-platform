@@ -73,9 +73,9 @@ MICROSOFT_SCOPES = ["Mail.Send", "Mail.ReadWrite"]
 # We therefore read replies/attachments from the Zoho mailbox via IMAP.
 # Microsoft Graph remains the outbound sender.
 
-ZOHO_IMAP_HOST = os.environ.get("ZOHO_IMAP_HOST", "imappro.zoho.com")
+ZOHO_IMAP_HOST = os.environ.get("ZOHO_IMAP_HOST", "imap.zoho.com")
 ZOHO_IMAP_PORT = int(os.environ.get("ZOHO_IMAP_PORT", "993"))
-ZOHO_IMAP_EMAIL = os.environ.get("ZOHO_IMAP_EMAIL", "").strip()
+ZOHO_IMAP_EMAIL = os.environ.get("ZOHO_IMAP_EMAIL", "").strip().replace("\\@", "@").replace("\n", "")
 ZOHO_IMAP_PASSWORD = os.environ.get("ZOHO_IMAP_PASSWORD", "")
 ZOHO_IMAP_FOLDER = os.environ.get("ZOHO_IMAP_FOLDER", "INBOX")
 
@@ -514,7 +514,7 @@ async def send_email(
 ) -> dict:
     """Create and send a Microsoft Graph message and return its IDs."""
     assert_safe_email(subject, html)
-    final_reply_to = reply_to or INBOUND_REPLY_EMAIL
+    final_reply_to = INBOUND_REPLY_EMAIL if ZOHO_IMAP_EMAIL else (reply_to or EMAIL_REPLY_TO or MICROSOFT_SENDER_EMAIL)
     access_token = _get_microsoft_access_token()
 
     message = {
@@ -624,13 +624,17 @@ def _graph_address(item: dict) -> str:
 
 
 class _ReplyScan(list):
-    """List-compatible reply scan result used by server.py."""
+    """List-compatible scan result used by server.py."""
+
+    def __init__(self, iterable=(), history_id=None):
+        super().__init__(iterable)
+        self.history_id = history_id
 
     def get(self, key, default=None):
         if key == "messages":
             return list(self)
         if key == "history_id":
-            return None
+            return self.history_id
         return default
 
 
@@ -659,63 +663,85 @@ def _iso_date(value: str | None) -> str:
         return value
 
 
+def _clean_zoho_password(value: str) -> str:
+    """Normalize an app password copied from Zoho/Render."""
+    value = (value or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    # Zoho app passwords are not supposed to contain spaces. Removing whitespace
+    # also protects IMAP LOGIN from accidental newlines when pasted into Render.
+    return "".join(value.split())
+
+
+def _zoho_hosts() -> list[str]:
+    configured = (ZOHO_IMAP_HOST or "imap.zoho.com").strip()
+    # Keep the configured host first. For Zoho organization mailboxes, the
+    # specialized IMAP endpoint is also commonly supported.
+    candidates = [
+        configured,
+        "imappro.zoho.com",
+        "imap.zoho.com",
+    ]
+    result: list[str] = []
+    for host in candidates:
+        if host and host not in result:
+            result.append(host)
+    return result
+
+
 def _zoho_open() -> imaplib.IMAP4_SSL:
-    """Open the Zoho IMAP inbox with an app password."""
-    if not _zoho_ready():
+    """Open the Zoho IMAP inbox with a Zoho app password."""
+    email_value = (ZOHO_IMAP_EMAIL or "").strip().replace("\\@", "@")
+    password_value = _clean_zoho_password(ZOHO_IMAP_PASSWORD)
+
+    if not email_value or not password_value:
         raise RuntimeError(
             "Zoho IMAP is not configured. Set ZOHO_IMAP_EMAIL and "
-            "ZOHO_IMAP_PASSWORD in Render Environment Variables."
+            "ZOHO_IMAP_PASSWORD (Zoho App Password) in Render Environment Variables."
         )
 
-    mailbox = imaplib.IMAP4_SSL(
-        ZOHO_IMAP_HOST,
-        ZOHO_IMAP_PORT,
+    last_error = None
+
+    for host in _zoho_hosts():
+        mailbox = None
+        try:
+            logger.info("Connecting to Zoho IMAP host %s as %s.", host, email_value)
+            mailbox = imaplib.IMAP4_SSL(
+                host,
+                ZOHO_IMAP_PORT,
+                timeout=20,
+            )
+            status, data = mailbox.login(email_value, password_value)
+
+            if status != "OK":
+                raise RuntimeError(f"Zoho IMAP login failed on {host}: {data!r}")
+
+            status, _ = mailbox.select(
+                ZOHO_IMAP_FOLDER,
+                readonly=True,
+            )
+            if status != "OK":
+                raise RuntimeError(
+                    f"Could not select Zoho IMAP folder {ZOHO_IMAP_FOLDER!r}."
+                )
+
+            logger.info("Zoho IMAP connected successfully using %s.", host)
+            return mailbox
+
+        except Exception as exc:
+            last_error = exc
+            logger.warning("Zoho IMAP connection/login failed on %s: %s", host, exc)
+            if mailbox is not None:
+                try:
+                    mailbox.logout()
+                except Exception:
+                    pass
+
+    raise RuntimeError(
+        "Zoho IMAP connection/login failed. Verify ZOHO_IMAP_EMAIL, "
+        "ZOHO_IMAP_PASSWORD (App Password), IMAP access, and the Zoho mailbox server. "
+        f"Last error: {last_error}"
     )
-    # Render copy/paste can accidentally leave a literal \@ in the email.
-    # Zoho app passwords are shown grouped with spaces; IMAP expects the
-    # actual password without those display spaces.
-    login_email = _normalize_email_address(ZOHO_IMAP_EMAIL)
-    login_password = re.sub(r"\s+", "", ZOHO_IMAP_PASSWORD or "")
-
-    if not login_email or not login_password:
-        raise RuntimeError(
-            "ZOHO_IMAP_EMAIL or ZOHO_IMAP_PASSWORD is empty after normalization."
-        )
-
-    try:
-        status, data = mailbox.login(
-            login_email,
-            login_password,
-        )
-    except Exception:
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
-        raise
-
-    if status != "OK":
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
-        raise RuntimeError(f"Zoho IMAP login failed: {data!r}")
-
-    status, _ = mailbox.select(
-        ZOHO_IMAP_FOLDER,
-        readonly=True,
-    )
-    if status != "OK":
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
-        raise RuntimeError(
-            f"Could not select Zoho IMAP folder {ZOHO_IMAP_FOLDER!r}."
-        )
-
-    return mailbox
-
 
 def _message_text_and_attachments(msg):
     """Extract readable body text and file attachments from an EmailMessage."""
@@ -858,28 +884,140 @@ def _zoho_fetch_uid_sync(uid: bytes | str) -> dict:
             pass
 
 
-def _zoho_find_incoming_sync(limit: int) -> _ReplyScan:
+def _zoho_fetch_raw_message(mailbox: imaplib.IMAP4_SSL, uid: bytes | str) -> bytes:
+    uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+    status, data = mailbox.uid("fetch", uid_text, "(BODY.PEEK[])")
+    if status != "OK":
+        raise RuntimeError(f"Zoho IMAP fetch failed for UID {uid_text}: {data!r}")
+
+    for item in data or []:
+        if isinstance(item, tuple) and len(item) >= 2 and item[1]:
+            return item[1]
+
+    raise RuntimeError(f"Zoho IMAP returned no message data for UID {uid_text}.")
+
+
+def _zoho_message_from_raw(raw_message: bytes, uid_text: str) -> dict:
+    msg = BytesParser(policy=policy.default).parsebytes(raw_message)
+
+    sender = parseaddr(msg.get("From", ""))[1].strip().lower()
+    to_values = [
+        parseaddr(x)[1].strip().lower()
+        for x in msg.get_all("To", [])
+        if parseaddr(x)[1]
+    ]
+
+    body, attachments = _message_text_and_attachments(msg)
+
+    message_id = (msg.get("Message-ID") or "").strip()
+    stable_id = f"zoho:{message_id}" if message_id else f"zoho-uid:{uid_text}"
+
+    return {
+        "id": stable_id,
+        "uid": uid_text,
+        "thread_id": None,
+        "internet_message_id": message_id or None,
+        "in_reply_to": (msg.get("In-Reply-To") or "").strip().lower(),
+        "references": (msg.get("References") or "").strip().lower(),
+        "from": sender,
+        "to": ", ".join(x for x in to_values if x),
+        "subject": _decode_mime_header(msg.get("Subject", "")),
+        "date": _iso_date(msg.get("Date", "")),
+        "body": body,
+        "body_type": "text/plain",
+        "reply_text": body,
+        "has_attachments": bool(attachments),
+        "parent_folder_id": ZOHO_IMAP_FOLDER,
+        "attachments": attachments,
+    }
+
+
+def _zoho_fetch_uid_sync(uid: bytes | str) -> dict:
+    """Fetch one message (compatibility helper)."""
     mailbox = _zoho_open()
     try:
-        status, data = mailbox.uid("search", None, "ALL")
+        uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+        return _zoho_message_from_raw(
+            _zoho_fetch_raw_message(mailbox, uid_text),
+            uid_text,
+        )
+    finally:
+        try:
+            mailbox.close()
+        except Exception:
+            pass
+        try:
+            mailbox.logout()
+        except Exception:
+            pass
+
+
+def _zoho_find_incoming_sync(
+    limit: int,
+    allowed_senders: set[str] | None = None,
+    after_uid: int | None = None,
+) -> _ReplyScan:
+    """Read recent/new Zoho messages using one IMAP connection."""
+    mailbox = _zoho_open()
+    try:
+        if after_uid is not None and after_uid >= 0:
+            status, data = mailbox.uid("search", None, "UID", f"{after_uid}:*")
+        else:
+            status, data = mailbox.uid("search", None, "ALL")
+
         if status != "OK":
             raise RuntimeError(f"Zoho IMAP search failed: {data!r}")
 
         raw_uids = (data[0] or b"").split()
-        raw_uids = raw_uids[-limit:]
-        results = _ReplyScan()
+        numeric_uids = [int(x) for x in raw_uids if str(x).isdigit()]
+        latest_uid = max(numeric_uids) if numeric_uids else after_uid
 
-        # Newest first. We fetch the most recent messages only.
+        # First sync: cap initial work. Later syncs: inspect only new UIDs.
+        if after_uid is None:
+            raw_uids = raw_uids[-max(1, limit):]
+
+        checkpoint = f"zoho:{latest_uid}" if latest_uid is not None else None
+        results = _ReplyScan(history_id=checkpoint)
+
+        allowed = {
+            (x or "").strip().lower().replace("\\@", "@")
+            for x in (allowed_senders or set())
+            if x
+        }
+
         for uid in reversed(raw_uids):
+            uid_text = uid.decode(errors="ignore") if isinstance(uid, bytes) else str(uid)
             try:
-                item = _zoho_fetch_uid_sync(uid)
-            except Exception:
-                logger.exception(
-                    "Could not read Zoho message UID %s",
-                    uid.decode(errors="ignore") if isinstance(uid, bytes) else uid,
+                status, header_data = mailbox.uid(
+                    "fetch",
+                    uid_text,
+                    "(BODY.PEEK[HEADER.FIELDS (FROM TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])",
                 )
-                continue
-            results.append(item)
+                if status != "OK":
+                    continue
+
+                raw_header = None
+                for item in header_data or []:
+                    if isinstance(item, tuple) and len(item) >= 2:
+                        raw_header = item[1]
+                        break
+                if not raw_header:
+                    continue
+
+                header_msg = BytesParser(policy=policy.default).parsebytes(raw_header)
+                sender = parseaddr(header_msg.get("From", ""))[1].strip().lower()
+
+                if allowed and sender not in allowed:
+                    continue
+
+                raw_message = _zoho_fetch_raw_message(mailbox, uid_text)
+                results.append(_zoho_message_from_raw(raw_message, uid_text))
+
+                if len(results) >= limit:
+                    break
+
+            except Exception:
+                logger.exception("Could not read Zoho message UID %s", uid_text)
 
         return results
     finally:
@@ -898,6 +1036,7 @@ async def find_incoming_replies(
     start_history_id: str | None = None,
     after_message_id: str | None = None,
     max_results: int = 500,
+    allowed_senders: set[str] | None = None,
 ) -> _ReplyScan:
     """Find replies from the mailbox that actually receives qhtalbros.com mail.
 
@@ -912,16 +1051,27 @@ async def find_incoming_replies(
     limit = max(1, min(int(max_results or 500), 500))
 
     if _zoho_ready():
+        after_uid = None
+        if start_history_id:
+            checkpoint = str(start_history_id).strip()
+            if checkpoint.lower().startswith("zoho:"):
+                checkpoint = checkpoint.split(":", 1)[1]
+            if checkpoint.isdigit():
+                after_uid = int(checkpoint)
+
         logger.info(
-            "Checking Zoho IMAP inbox %s for incoming replies.",
+            "Checking Zoho IMAP inbox %s for incoming replies (after UID %s).",
             ZOHO_IMAP_EMAIL,
+            after_uid,
         )
         result = await asyncio.to_thread(
             _zoho_find_incoming_sync,
             limit,
+            allowed_senders,
+            after_uid,
         )
         logger.info(
-            "Zoho IMAP incoming scan found %d message(s).",
+            "Zoho IMAP incoming scan found %d relevant message(s).",
             len(result),
         )
         return result
@@ -1203,3 +1353,4 @@ def _zoho_get_message_details_sync(message_id: str) -> dict:
             mailbox.logout()
         except Exception:
             pass
+
