@@ -1498,11 +1498,17 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
         start_history_id = state.get("history_id") if state else None
         last_uid = int(state.get("last_uid") or 0) if state else 0
 
+        # A manual Sync must also recover a reply that was seen by an earlier
+        # background poll but was not fully processed yet.  Keep a small UID
+        # lookback instead of trusting last_uid blindly. Already-saved replies
+        # are deduplicated by message_id below, so this is safe.
+        scan_after_uid = max(0, last_uid - 50) if force else last_uid
+
         try:
             scan = await find_incoming_replies(
                 start_history_id=start_history_id,
-                after_uid=last_uid,
-                max_results=25,
+                after_uid=scan_after_uid,
+                max_results=50 if force else 25,
             )
         except Exception as exc:
             # Do not turn a temporary mailbox rate-limit condition into a
@@ -1613,7 +1619,10 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
             # The Zoho polling scan intentionally fetches headers only.
             # Once a message is matched to a sent recipient, fetch the full
             # message exactly once so body + attachments are available.
-            details = await get_incoming_message_details(message_id)
+            details = await get_incoming_message_details(
+                message_id,
+                zoho_uid=item.get("uid"),
+            )
             attachments = []
             total_size = 0
             for attachment in details.get("attachments", []):
@@ -1692,11 +1701,37 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
             upsert=True,
         )
 
+        # The dashboard's Sync toast should report what is actually present
+        # after the sync, not only what was inserted during this particular
+        # poll. Otherwise a reply that was already saved correctly appears as
+        # "0 replies, 0 attachments" even though the report contains it.
+        sent_recipient_ids = [r.get("id") for r in sent_rows if r.get("id")]
+        total_replies = 0
+        total_attachments = 0
+        if sent_recipient_ids:
+            total_replies = await db.email_replies.count_documents(
+                {"recipient_id": {"$in": sent_recipient_ids}}
+            )
+            saved_reply_docs = await db.email_replies.find(
+                {"recipient_id": {"$in": sent_recipient_ids}},
+                {"_id": 0, "attachments": 1},
+            ).to_list(50000)
+            total_attachments = sum(
+                len(doc.get("attachments") or []) for doc in saved_reply_docs
+            )
+
         return {
             "checked": len(incoming),
             "matched": matched,
-            "new_replies": new_replies,
-            "attachments": attachment_count,
+            # Keep new_replies for backward compatibility, but make the manual
+            # sync result reflect the current saved state so the UI does not
+            # report zero after a successful previous processing pass.
+            "new_replies": total_replies if force else new_replies,
+            "attachments": total_attachments if force else attachment_count,
+            "new_replies_this_sync": new_replies,
+            "attachments_this_sync": attachment_count,
+            "total_replies": total_replies,
+            "total_attachments": total_attachments,
             "rate_limited": False,
         }
 
