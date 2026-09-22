@@ -1364,7 +1364,7 @@ def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
 # ---------------------------------------------------------------------------
 
 MAX_REPLY_ATTACHMENT_BYTES = 25 * 1024 * 1024
-REPLY_SYNC_INTERVAL_SECONDS = 10
+REPLY_SYNC_INTERVAL_SECONDS = 1
 REPLY_SYNC_LOCK = asyncio.Lock()
 _last_reply_sync_at = 0.0
 
@@ -1460,7 +1460,7 @@ def _normalize_subject(value: str) -> str:
 
 
 async def _sync_incoming_replies(*, force: bool = False) -> dict:
-    """Sync Microsoft Graph replies and attachments into MongoDB/GridFS."""
+    """Sync Zoho IMAP replies and attachments into MongoDB/GridFS."""
     global _last_reply_sync_at
 
     now = asyncio.get_running_loop().time()
@@ -1496,18 +1496,13 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
             {"id": "incoming_replies"}, {"_id": 0}
         )
         start_history_id = state.get("history_id") if state else None
+        last_uid = int(state.get("last_uid") or 0) if state else 0
 
         try:
-            allowed_senders = {
-                (row.get("email") or "").strip().lower()
-                for row in sent_rows
-                if row.get("email")
-            }
-
             scan = await find_incoming_replies(
                 start_history_id=start_history_id,
-                max_results=500,
-                allowed_senders=allowed_senders,
+                after_uid=last_uid,
+                max_results=25,
             )
         except Exception as exc:
             # Do not turn a temporary mailbox rate-limit condition into a
@@ -1530,9 +1525,11 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
         if isinstance(scan, list):
             incoming = list(scan)
             history_id = None
+            scanned_last_uid = getattr(scan, "last_uid", last_uid)
         else:
             incoming = scan.get("messages", [])
             history_id = scan.get("history_id")
+            scanned_last_uid = scan.get("last_uid", last_uid)
 
         by_thread = {}
         for row in sent_rows:
@@ -1613,11 +1610,7 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                 continue
 
             matched += 1
-            if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
-                # Zoho scanner already downloaded body + attachments. Reuse it.
-                details = item
-            else:
-                details = await get_incoming_message_details(message_id)
+            details = await get_incoming_message_details(message_id)
             attachments = []
             total_size = 0
             for attachment in details.get("attachments", []):
@@ -1687,12 +1680,14 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
 
         # Advance the history checkpoint only after the messages have been
         # processed successfully. This makes transient failures retryable.
+        state_update = {"id": "incoming_replies", "last_uid": int(scanned_last_uid or last_uid), "updated_at": now_iso()}
         if history_id:
-            await db.email_sync_state.update_one(
-                {"id": "incoming_replies"},
-                {"$set": {"id": "incoming_replies", "history_id": str(history_id), "updated_at": now_iso()}},
-                upsert=True,
-            )
+            state_update["history_id"] = str(history_id)
+        await db.email_sync_state.update_one(
+            {"id": "incoming_replies"},
+            {"$set": state_update},
+            upsert=True,
+        )
 
         return {
             "checked": len(incoming),
@@ -1706,13 +1701,12 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
 @api.post("/replies/sync")
 async def sync_replies(user: dict = Depends(get_current_user)):
     try:
-        # Manual button always performs a fresh mailbox check immediately.
-        result = await _sync_incoming_replies(force=True)
+        result = await _sync_incoming_replies(force=False)
     except Exception as exc:
         logger.exception("Reply sync failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Could not sync email replies from Zoho: {exc}",
+            detail=f"Could not sync incoming email replies: {exc}",
         )
     await log_audit(
         user["email"],
@@ -1870,8 +1864,8 @@ async def _reply_sync_loop():
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Background email reply sync failed")
-        await asyncio.sleep(10)
+            logger.exception("Background incoming email reply sync failed")
+        await asyncio.sleep(2)
 
 
 @api.get("/reports/recipient-data")
@@ -2155,7 +2149,7 @@ async def startup():
     await db.email_replies.create_index("message_id", unique=True)
     await db.email_replies.create_index("thread_id")
     await db.email_replies.create_index("recipient_id")
-    await db.gmail_sync_state.create_index("id", unique=True)
+    await db.email_sync_state.create_index("id", unique=True)
 
     app.state.reply_sync_task = asyncio.create_task(_reply_sync_loop())
 
