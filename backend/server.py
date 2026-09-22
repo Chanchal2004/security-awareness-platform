@@ -1700,7 +1700,7 @@ async def sync_replies(user: dict = Depends(get_current_user)):
         logger.exception("Reply sync failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Could not sync Outlook/Microsoft replies: {exc}",
+            detail=f"Could not sync incoming email replies: {exc}",
         )
     await log_audit(
         user["email"],
@@ -1858,7 +1858,7 @@ async def _reply_sync_loop():
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Background Microsoft Graph reply sync failed")
+            logger.exception("Background incoming email reply sync failed")
         await asyncio.sleep(900)
 
 
@@ -2143,7 +2143,7 @@ async def startup():
     await db.email_replies.create_index("message_id", unique=True)
     await db.email_replies.create_index("thread_id")
     await db.email_replies.create_index("recipient_id")
-    await db.gmail_sync_state.create_index("id", unique=True)
+    await db.email_sync_state.create_index("id", unique=True)
 
     app.state.reply_sync_task = asyncio.create_task(_reply_sync_loop())
 
