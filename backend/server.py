@@ -1498,9 +1498,16 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
         start_history_id = state.get("history_id") if state else None
 
         try:
+            allowed_senders = {
+                (row.get("email") or "").strip().lower()
+                for row in sent_rows
+                if row.get("email")
+            }
+
             scan = await find_incoming_replies(
                 start_history_id=start_history_id,
                 max_results=500,
+                allowed_senders=allowed_senders,
             )
         except Exception as exc:
             # Do not turn a temporary mailbox rate-limit condition into a
@@ -1606,7 +1613,11 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                 continue
 
             matched += 1
-            details = await get_incoming_message_details(message_id)
+            if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
+                # Zoho scanner already downloaded body + attachments. Reuse it.
+                details = item
+            else:
+                details = await get_incoming_message_details(message_id)
             attachments = []
             total_size = 0
             for attachment in details.get("attachments", []):
@@ -1695,12 +1706,13 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
 @api.post("/replies/sync")
 async def sync_replies(user: dict = Depends(get_current_user)):
     try:
-        result = await _sync_incoming_replies(force=False)
+        # Manual button always performs a fresh mailbox check immediately.
+        result = await _sync_incoming_replies(force=True)
     except Exception as exc:
         logger.exception("Reply sync failed")
         raise HTTPException(
             status_code=502,
-            detail=f"Could not sync incoming email replies: {exc}",
+            detail=f"Could not sync email replies from Zoho: {exc}",
         )
     await log_audit(
         user["email"],
@@ -1858,8 +1870,8 @@ async def _reply_sync_loop():
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Background incoming email reply sync failed")
-        await asyncio.sleep(900)
+            logger.exception("Background email reply sync failed")
+        await asyncio.sleep(10)
 
 
 @api.get("/reports/recipient-data")
@@ -2143,7 +2155,7 @@ async def startup():
     await db.email_replies.create_index("message_id", unique=True)
     await db.email_replies.create_index("thread_id")
     await db.email_replies.create_index("recipient_id")
-    await db.email_sync_state.create_index("id", unique=True)
+    await db.gmail_sync_state.create_index("id", unique=True)
 
     app.state.reply_sync_task = asyncio.create_task(_reply_sync_loop())
 
