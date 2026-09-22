@@ -1610,14 +1610,10 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
                 continue
 
             matched += 1
-            # Zoho scans already contain the full parsed message (body + attachments).
-            # Re-fetching the same message opened a second IMAP connection and added
-            # avoidable seconds to reply sync. Only use the detail fetch for non-Zoho
-            # messages (e.g. the Graph fallback).
-            if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
-                details = item
-            else:
-                details = await get_incoming_message_details(message_id)
+            # The Zoho polling scan intentionally fetches headers only.
+            # Once a message is matched to a sent recipient, fetch the full
+            # message exactly once so body + attachments are available.
+            details = await get_incoming_message_details(message_id)
             attachments = []
             total_size = 0
             for attachment in details.get("attachments", []):
@@ -1708,7 +1704,7 @@ async def _sync_incoming_replies(*, force: bool = False) -> dict:
 @api.post("/replies/sync")
 async def sync_replies(user: dict = Depends(get_current_user)):
     try:
-        result = await _sync_incoming_replies(force=False)
+        result = await _sync_incoming_replies(force=True)
     except Exception as exc:
         logger.exception("Reply sync failed")
         raise HTTPException(
