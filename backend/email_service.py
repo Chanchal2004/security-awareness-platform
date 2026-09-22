@@ -914,14 +914,12 @@ def _zoho_find_incoming_sync(limit: int, after_uid: int | None = None) -> _Reply
         results.last_uid = scanned_last_uid
         return results
     finally:
-        try:
-            mailbox.close()
-        except Exception:
-            pass
-        try:
-            mailbox.logout()
-        except Exception:
-            pass
+        # Keep the authenticated IMAP connection alive between polls.
+        # Closing/logging out here was the main source of the 1-2 second
+        # delay because every poll had to reconnect to Zoho. _zoho_open()
+        # validates the existing connection and reconnects automatically if
+        # Zoho has dropped it.
+        pass
 
 
 async def find_incoming_replies(
@@ -1136,10 +1134,18 @@ async def get_message_attachments(message_id: str) -> list[dict]:
     return results
 
 
-async def get_incoming_message_details(message_id: str) -> dict:
-    """Get one reply's body and attachments from Zoho or Graph."""
+async def get_incoming_message_details(
+    message_id: str,
+    zoho_uid: str | int | None = None,
+) -> dict:
+    """Get one reply's body and attachments from Zoho or Graph.
+
+    When the incremental Zoho scan already knows the UID, use it directly.
+    This avoids a second IMAP Message-ID search and makes reply+attachment
+    processing noticeably faster.
+    """
     if message_id.startswith("zoho:") or message_id.startswith("zoho-uid:"):
-        uid_or_message_id = message_id
+        uid_or_message_id = f"zoho-uid:{zoho_uid}" if zoho_uid is not None else message_id
         return await asyncio.to_thread(
             _zoho_get_message_details_sync,
             uid_or_message_id,
