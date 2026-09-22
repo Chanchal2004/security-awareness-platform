@@ -73,7 +73,7 @@ MICROSOFT_SCOPES = ["Mail.Send", "Mail.ReadWrite"]
 # We therefore read replies/attachments from the Zoho mailbox via IMAP.
 # Microsoft Graph remains the outbound sender.
 
-ZOHO_IMAP_HOST = os.environ.get("ZOHO_IMAP_HOST", "imap.zoho.com")
+ZOHO_IMAP_HOST = os.environ.get("ZOHO_IMAP_HOST", "imappro.zoho.com")
 ZOHO_IMAP_PORT = int(os.environ.get("ZOHO_IMAP_PORT", "993"))
 ZOHO_IMAP_EMAIL = os.environ.get("ZOHO_IMAP_EMAIL", "").strip()
 ZOHO_IMAP_PASSWORD = os.environ.get("ZOHO_IMAP_PASSWORD", "")
@@ -671,10 +671,21 @@ def _zoho_open() -> imaplib.IMAP4_SSL:
         ZOHO_IMAP_HOST,
         ZOHO_IMAP_PORT,
     )
+    # Render copy/paste can accidentally leave a literal \@ in the email.
+    # Zoho app passwords are shown grouped with spaces; IMAP expects the
+    # actual password without those display spaces.
+    login_email = _normalize_email_address(ZOHO_IMAP_EMAIL)
+    login_password = re.sub(r"\s+", "", ZOHO_IMAP_PASSWORD or "")
+
+    if not login_email or not login_password:
+        raise RuntimeError(
+            "ZOHO_IMAP_EMAIL or ZOHO_IMAP_PASSWORD is empty after normalization."
+        )
+
     try:
         status, data = mailbox.login(
-            ZOHO_IMAP_EMAIL,
-            ZOHO_IMAP_PASSWORD,
+            login_email,
+            login_password,
         )
     except Exception:
         try:
@@ -1192,4 +1203,3 @@ def _zoho_get_message_details_sync(message_id: str) -> dict:
             mailbox.logout()
         except Exception:
             pass
-
