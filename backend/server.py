@@ -955,14 +955,18 @@ async def get_simulation(sid: str, user: dict = Depends(get_current_user)):
 
 @api.get("/simulations/{sid}/recipients")
 async def sim_recipients(sid: str, user: dict = Depends(get_current_user)):
-    return await db.simulation_recipients.find({"simulation_id": sid}, {"_id": 0}).to_list(10000)
+    rows = await db.simulation_recipients.find(
+        {"simulation_id": sid}, {"_id": 0}
+    ).to_list(10000)
+    return [_format_api_timestamps(row) for row in rows]
 
 
 @api.get("/simulations/{sid}/recipients/{srid}/timeline")
 async def recipient_timeline(sid: str, srid: str, user: dict = Depends(get_current_user)):
     events = await db.simulation_events.find(
-        {"simulation_id": sid, "recipient_id": srid}, {"_id": 0}).sort("timestamp", 1).to_list(1000)
-    return events
+        {"simulation_id": sid, "recipient_id": srid}, {"_id": 0}
+    ).sort("timestamp", 1).to_list(1000)
+    return [_format_api_timestamps(event) for event in events]
 
 
 def build_email_html(sim: dict, sr: dict) -> str:
@@ -1384,6 +1388,17 @@ def _format_csv_report_value(column: str, value):
         if dt is not None:
             return dt.strftime(REPORT_TIME_FORMAT)
     return value
+
+
+def _format_api_timestamps(record: dict) -> dict:
+    """Return a copy with timestamp fields formatted in India time for dashboard display."""
+    formatted = dict(record)
+    for key, value in record.items():
+        if _is_report_timestamp_column(key) and isinstance(value, str):
+            dt = _parse_report_timestamp(value)
+            if dt is not None:
+                formatted[key] = dt.strftime("%d-%b-%Y %I:%M:%S %p")
+    return formatted
 
 
 def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
