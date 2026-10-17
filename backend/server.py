@@ -1345,14 +1345,53 @@ async def recipient_analytics(
 
 
 # ---------------------------------------------------------------------------
-# Reports (CSV export)
+# Reports (CSV / Excel timestamp formatting)
 # ---------------------------------------------------------------------------
+REPORT_TIMEZONE = timezone(timedelta(hours=5, minutes=30))  # India Standard Time
+REPORT_TIME_FORMAT = "%d-%b-%Y %I:%M:%S %p"
+REPORT_TIMESTAMP_COLUMNS = {
+    "timestamp", "created_at", "updated_at", "sent_at", "sent_time",
+    "delivered_at", "first_open", "last_open", "first_click", "last_click",
+    "submission_time", "form_submitted_at", "last_activity", "reply_received_at",
+    "received_at", "uploaded_at", "scheduled_at", "event_time",
+}
+
+
+def _parse_report_timestamp(value):
+    """Parse ISO timestamps and convert aware values to India Standard Time."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            # Existing naive values are treated as UTC to avoid silently shifting them incorrectly.
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(REPORT_TIMEZONE).replace(tzinfo=None)
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _is_report_timestamp_column(column: str) -> bool:
+    name = (column or "").lower()
+    return name in REPORT_TIMESTAMP_COLUMNS or name.endswith(("_at", "_timestamp", "_datetime"))
+
+
+def _format_csv_report_value(column: str, value):
+    if value is None:
+        return ""
+    if _is_report_timestamp_column(column):
+        dt = _parse_report_timestamp(value)
+        if dt is not None:
+            return dt.strftime(REPORT_TIME_FORMAT)
+    return value
+
+
 def csv_response(rows: List[dict], fieldnames: List[str], filename: str):
     out = io.StringIO()
     writer = csv.DictWriter(out, fieldnames=fieldnames, extrasaction="ignore")
     writer.writeheader()
     for r in rows:
-        writer.writerow(r)
+        writer.writerow({k: _format_csv_report_value(k, v) for k, v in r.items()})
     out.seek(0)
     return StreamingResponse(iter([out.getvalue()]), media_type="text/csv",
                              headers={"Content-Disposition": f"attachment; filename={filename}"})
@@ -2053,7 +2092,17 @@ async def report_recipient_xlsx(simulation_id: Optional[str] = None, user: dict 
     for ridx, row in enumerate(rows, 2):
         for cidx, col in enumerate(columns, 1):
             value = row.get(col, "")
-            ws.cell(ridx, cidx, "" if value is None else str(value))
+            if value is None:
+                ws.cell(ridx, cidx, "")
+            elif _is_report_timestamp_column(col):
+                dt = _parse_report_timestamp(value)
+                if dt is not None:
+                    cell = ws.cell(ridx, cidx, dt)
+                    cell.number_format = "dd-mmm-yyyy hh:mm:ss AM/PM"
+                else:
+                    ws.cell(ridx, cidx, str(value))
+            else:
+                ws.cell(ridx, cidx, str(value))
         for i, a in enumerate(row.get("_attachment_files", [])):
             file_id = a.get("file_id")
             filename = a.get("filename") or "Document"
