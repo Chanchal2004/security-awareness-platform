@@ -65,7 +65,7 @@ MICROSOFT_AUTHORITY = os.environ.get(
 )
 MICROSOFT_SENDER_EMAIL = os.environ.get(
     "MICROSOFT_SENDER_EMAIL",
-    "qherptest@qhtalbros.com",
+    "chanchal@qhtalbros.com",
 )
 MICROSOFT_TOKEN_CACHE = os.environ.get("MICROSOFT_TOKEN_CACHE")
 MICROSOFT_SCOPES = ["Mail.Send", "Mail.ReadWrite"]
@@ -83,6 +83,15 @@ ZOHO_IMAP_PORT = int(os.environ.get("ZOHO_IMAP_PORT", "993"))
 ZOHO_IMAP_EMAIL = os.environ.get("ZOHO_IMAP_EMAIL", "").strip()
 ZOHO_IMAP_PASSWORD = os.environ.get("ZOHO_IMAP_PASSWORD", "")
 ZOHO_IMAP_FOLDER = os.environ.get("ZOHO_IMAP_FOLDER", "INBOX")
+
+# Zoho Mail API outbound sending (India data center)
+ZOHO_CLIENT_ID = os.environ.get("ZOHO_CLIENT_ID", "").strip()
+ZOHO_CLIENT_SECRET = os.environ.get("ZOHO_CLIENT_SECRET", "").strip()
+ZOHO_REFRESH_TOKEN = os.environ.get("ZOHO_REFRESH_TOKEN", "").strip()
+ZOHO_MAIL_ACCOUNT_ID = os.environ.get("ZOHO_MAIL_ACCOUNT_ID", "").strip()
+ZOHO_OAUTH_BASE = os.environ.get("ZOHO_OAUTH_BASE", "https://accounts.zoho.in").rstrip("/")
+ZOHO_MAIL_API_BASE = os.environ.get("ZOHO_MAIL_API_BASE", "https://mail.zoho.in").rstrip("/")
+ZOHO_SENDER_EMAIL = os.environ.get("ZOHO_SENDER_EMAIL", ZOHO_IMAP_EMAIL).strip()
 
 # When Zoho IMAP is configured, force replies to the same Zoho mailbox.
 # Otherwise fall back to EMAIL_REPLY_TO / Microsoft sender.
@@ -483,30 +492,20 @@ def _get_microsoft_access_token() -> str:
     if not accounts:
         raise RuntimeError(
             "No Microsoft login account was found in MICROSOFT_TOKEN_CACHE. "
-            "Check that the complete serialized MSAL cache is set in Render and "
-            "that MICROSOFT_SENDER_EMAIL matches the account in the cache."
+            "Run the local Microsoft login/token-cache generator again and copy the "
+            "complete MSAL cache JSON into Render."
         )
 
-    result = app.acquire_token_silent_with_error(
+    result = app.acquire_token_silent(
         MICROSOFT_SCOPES,
         account=accounts[0],
     )
 
     if not result or "access_token" not in result:
-        error = (result or {}).get("error", "unknown_error")
-        suberror = (result or {}).get("suberror", "")
-        description = (result or {}).get("error_description", "")
-
-        # Log authentication diagnostics only. Never log access/refresh tokens.
-        logger.error(
-            "Microsoft token acquisition failed: error=%s, suberror=%s, description=%s",
-            error,
-            suberror,
-            description,
-        )
+        error = (result or {}).get("error_description") or (result or {}).get("error")
         raise RuntimeError(
-            f"Microsoft token acquisition failed: {error}. "
-            "Check Render logs for authentication details."
+            "Microsoft token acquisition failed."
+            + (f" {error}" if error else "")
         )
 
     logger.info(
@@ -520,6 +519,43 @@ def _get_microsoft_access_token() -> str:
 # SEND EMAIL WITH MICROSOFT GRAPH API
 # ============================================================
 
+def _get_zoho_access_token() -> str:
+    """Exchange the long-lived Zoho refresh token for a short-lived access token."""
+    required = {
+        "ZOHO_CLIENT_ID": ZOHO_CLIENT_ID,
+        "ZOHO_CLIENT_SECRET": ZOHO_CLIENT_SECRET,
+        "ZOHO_REFRESH_TOKEN": ZOHO_REFRESH_TOKEN,
+    }
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(
+            "Missing Zoho OAuth environment variable(s): " + ", ".join(missing)
+        )
+
+    response = httpx.post(
+        f"{ZOHO_OAUTH_BASE}/oauth/v2/token",
+        data={
+            "grant_type": "refresh_token",
+            "client_id": ZOHO_CLIENT_ID,
+            "client_secret": ZOHO_CLIENT_SECRET,
+            "refresh_token": ZOHO_REFRESH_TOKEN,
+        },
+        timeout=20.0,
+    )
+    try:
+        payload = response.json()
+    except Exception:
+        payload = {"response": response.text[:500]}
+
+    if response.status_code != 200 or not payload.get("access_token"):
+        # Never log or return client secrets or tokens.
+        raise RuntimeError(
+            f"Zoho access-token refresh failed (HTTP {response.status_code}): "
+            f"{payload.get('error') or payload.get('error_description') or 'check Zoho OAuth settings'}"
+        )
+    return payload["access_token"]
+
+
 async def send_email(
     *,
     to: str,
@@ -527,70 +563,67 @@ async def send_email(
     html: str,
     reply_to: str | None = None,
 ) -> dict:
-    """Send outbound mail through the existing Microsoft Graph setup.
-
-    Zoho IMAP is used only for inbound reply sync.
-    """
+    """Send outbound mail through Zoho Mail API; retain server.py interface."""
     assert_safe_email(subject, html)
-    final_reply_to = reply_to or INBOUND_REPLY_EMAIL
-    access_token = _get_microsoft_access_token()
 
-    message = {
-        "subject": subject,
-        "body": {"contentType": "HTML", "content": html},
-        "toRecipients": [{"emailAddress": {"address": to}}],
-    }
-    if final_reply_to:
-        message["replyTo"] = [{"emailAddress": {"address": final_reply_to}}]
+    if not ZOHO_MAIL_ACCOUNT_ID:
+        raise RuntimeError(
+            "ZOHO_MAIL_ACCOUNT_ID is missing. Get it from Zoho Mail API GET /api/accounts."
+        )
+    sender = ZOHO_SENDER_EMAIL or ZOHO_IMAP_EMAIL
+    if not sender:
+        raise RuntimeError(
+            "Set ZOHO_SENDER_EMAIL (or ZOHO_IMAP_EMAIL) to the Zoho mailbox address."
+        )
 
+    access_token = await asyncio.to_thread(_get_zoho_access_token)
+    endpoint = (
+        f"{ZOHO_MAIL_API_BASE}/api/accounts/"
+        f"{ZOHO_MAIL_ACCOUNT_ID}/messages"
+    )
     headers = {
-        "Authorization": f"Bearer {access_token}",
+        "Authorization": f"Zoho-oauthtoken {access_token}",
         "Content-Type": "application/json",
+        "Accept": "application/json",
     }
+    payload = {
+        "fromAddress": sender,
+        "toAddress": to,
+        "subject": subject,
+        "content": html,
+        "mailFormat": "html",
+    }
+    # The sender mailbox should be the monitored Zoho inbox so replies remain
+    # visible to the existing Zoho IMAP reply scanner. If an explicit reply_to
+    # is supplied and the API supports it, include it; otherwise sender defaults
+    # to the monitored mailbox and replies return there.
+    if reply_to:
+        payload["replyTo"] = reply_to
 
     async with httpx.AsyncClient(timeout=30.0) as client:
-        create_response = await client.post(
-            "https://graph.microsoft.com/v1.0/me/messages",
-            headers=headers,
-            json=message,
+        response = await client.post(endpoint, headers=headers, json=payload)
+
+    try:
+        result = response.json()
+    except Exception:
+        result = {"response": response.text[:500]}
+
+    status_obj = result.get("status") or {}
+    api_code = status_obj.get("code")
+    api_ok = api_code in (200, 201, "200", "201")
+    if response.status_code not in (200, 201, 202) or (api_code is not None and not api_ok):
+        detail = status_obj.get("description") or result.get("message") or result.get("error") or "Zoho Mail API rejected the request"
+        raise RuntimeError(
+            f"Zoho Mail send failed (HTTP {response.status_code}): {detail}"
         )
-        if create_response.status_code not in (200, 201):
-            try:
-                detail = create_response.json()
-            except Exception:
-                detail = create_response.text
-            raise RuntimeError(
-                f"Microsoft Graph draft creation failed (HTTP {create_response.status_code}): {detail}"
-            )
 
-        created = create_response.json()
-        message_id = created.get("id")
-        conversation_id = created.get("conversationId")
-        internet_message_id = created.get("internetMessageId")
-        if not message_id:
-            raise RuntimeError("Microsoft Graph did not return a message ID.")
-
-        send_response = await client.post(
-            f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/send",
-            headers=headers,
-        )
-        if send_response.status_code != 202:
-            try:
-                detail = send_response.json()
-            except Exception:
-                detail = send_response.text
-            raise RuntimeError(
-                f"Microsoft Graph send failed (HTTP {send_response.status_code}): {detail}"
-            )
-
-    logger.info(
-        "Email accepted by Microsoft Graph for %s from %s (message=%s, conversation=%s)",
-        to, MICROSOFT_SENDER_EMAIL, message_id, conversation_id,
-    )
+    data = result.get("data") or {}
+    message_id = data.get("messageId") or data.get("message_id") or data.get("id")
+    logger.info("Email accepted by Zoho Mail API for %s from %s.", to, sender)
     return {
-        "id": message_id,
-        "thread_id": conversation_id,
-        "internet_message_id": internet_message_id,
+        "id": str(message_id or ""),
+        "thread_id": None,
+        "internet_message_id": data.get("internetMessageId") or data.get("messageId"),
     }
 
 
