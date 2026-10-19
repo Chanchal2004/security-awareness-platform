@@ -65,7 +65,7 @@ MICROSOFT_AUTHORITY = os.environ.get(
 )
 MICROSOFT_SENDER_EMAIL = os.environ.get(
     "MICROSOFT_SENDER_EMAIL",
-    "chanchal@qhtalbros.com",
+    "qherptest@qhtalbros.com",
 )
 MICROSOFT_TOKEN_CACHE = os.environ.get("MICROSOFT_TOKEN_CACHE")
 MICROSOFT_SCOPES = ["Mail.Send", "Mail.ReadWrite"]
