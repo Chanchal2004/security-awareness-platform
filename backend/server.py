@@ -977,7 +977,7 @@ def build_email_html(sim: dict, sr: dict) -> str:
     cta = (f'<div style="margin:24px 0"><a href="{click_url}" '
            f'style="background:#4f46e5;color:#ffffff;padding:12px 22px;border-radius:8px;'
            f'text-decoration:none;font-family:Arial,sans-serif;font-size:14px;display:inline-block">'
-           f'Open Secure Document</a></div>') if sim["tracking"].get("click") else ""
+           f'Review Security Notice</a></div>') if sim["tracking"].get("click") else ""
     footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
               f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
               f'We never ask for your password or payment details by email.</p>')
