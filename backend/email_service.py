@@ -483,20 +483,30 @@ def _get_microsoft_access_token() -> str:
     if not accounts:
         raise RuntimeError(
             "No Microsoft login account was found in MICROSOFT_TOKEN_CACHE. "
-            "Run the local Microsoft login/token-cache generator again and copy the "
-            "complete MSAL cache JSON into Render."
+            "Check that the complete serialized MSAL cache is set in Render and "
+            "that MICROSOFT_SENDER_EMAIL matches the account in the cache."
         )
 
-    result = app.acquire_token_silent(
+    result = app.acquire_token_silent_with_error(
         MICROSOFT_SCOPES,
         account=accounts[0],
     )
 
     if not result or "access_token" not in result:
-        error = (result or {}).get("error_description") or (result or {}).get("error")
+        error = (result or {}).get("error", "unknown_error")
+        suberror = (result or {}).get("suberror", "")
+        description = (result or {}).get("error_description", "")
+
+        # Log authentication diagnostics only. Never log access/refresh tokens.
+        logger.error(
+            "Microsoft token acquisition failed: error=%s, suberror=%s, description=%s",
+            error,
+            suberror,
+            description,
+        )
         raise RuntimeError(
-            "Microsoft token acquisition failed."
-            + (f" {error}" if error else "")
+            f"Microsoft token acquisition failed: {error}. "
+            "Check Render logs for authentication details."
         )
 
     logger.info(
