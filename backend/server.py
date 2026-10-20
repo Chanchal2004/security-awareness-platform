@@ -690,9 +690,17 @@ class FormBody(BaseModel):
     fields: List[FormField] = []
 
 
+ALLOWED_FORM_FIELD_TYPES = {"text", "email", "phone", "textarea", "yes_no"}
+
+
 def validate_form_fields(fields: List[FormField]):
     for f in fields:
         low = f.label.lower()
+        if f.type not in ALLOWED_FORM_FIELD_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported field type '{f.type}'. Allowed types: text, email, phone, textarea, yes_no.",
+            )
         if any(w in low for w in BANNED_FIELD_WORDS):
             raise HTTPException(status_code=400,
                                 detail=f"Field '{f.label}' is not allowed. Awareness forms may not collect credentials or sensitive secrets.")
@@ -974,10 +982,11 @@ def build_email_html(sim: dict, sr: dict) -> str:
     click_url = f"{base}/api/track/click/{sr['token']}"
     pixel = f'<img src="{base}/api/track/open/{sr["token"]}.png" width="1" height="1" alt="" style="display:none" />' if sim["tracking"].get("open") else ""
     body = sim["body_html"]
-    cta = (f'<div style="margin:24px 0"><a href="{click_url}" '
-           f'style="background:#4f46e5;color:#ffffff;padding:12px 22px;border-radius:8px;'
-           f'text-decoration:none;font-family:Arial,sans-serif;font-size:14px;display:inline-block">'
-           f'Review Security Notice</a></div>') if sim["tracking"].get("click") else ""
+    # A clearly labeled link for authorized security-awareness exercises.
+    # The unique tracking URL is preserved so clicks continue to be recorded.
+    cta = (f'<p style="margin:16px 0;font-family:Arial,sans-serif;font-size:14px">'
+           f'<a href="{click_url}" style="color:#0563c1;text-decoration:underline">'
+           f'Review Security Notice</a></p>') if sim["tracking"].get("click") else ""
     footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
               f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
               f'We never ask for your password or payment details by email.</p>')
