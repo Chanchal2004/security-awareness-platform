@@ -991,7 +991,6 @@ def build_email_html(sim: dict, sr: dict) -> str:
         r"|Verify Your Account Now|Activate Your Account Now",
         re.IGNORECASE,
     )
-    has_inline_link = bool(link_placeholder_pattern.search(body))
     if sim["tracking"].get("click"):
         tracked_link = (
             f'<a href="{click_url}" '
@@ -1001,13 +1000,9 @@ def build_email_html(sim: dict, sr: dict) -> str:
     else:
         tracked_link = "Review Security Notice"
 
-    if has_inline_link:
-        body = link_placeholder_pattern.sub(lambda _match: tracked_link, body)
-        cta = ""
-    else:
-        # Backward-compatible fallback for existing templates without an inline marker.
-        cta = (f'<p style="margin:16px 0;font-family:Arial,sans-serif;font-size:14px">'
-               f'{tracked_link}</p>') if sim["tracking"].get("click") else ""
+    # Replace the marker/text in-place only. Never append a second CTA at the end.
+    body = link_placeholder_pattern.sub(lambda _match: tracked_link, body)
+    cta = ""
 
     footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
               f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
@@ -2311,13 +2306,13 @@ async def startup():
                                      "provider": "Resend", "status": "ACTIVE",
                                      "created_at": now_iso()})
     if await db.landing_pages.count_documents({}) == 0:
-        await db.landing_pages.insert_one({
-            "id": new_id(), "name": "Talbros Security Awareness Check",
-            "title": "TALBROS SECURITY AWARENESS CHECK",
-            "message": "This was a simulated phishing awareness exercise conducted by the Talbros Security team. No harm was done.",
-            "indicators": "Check the sender address carefully. Hover links before clicking. Be wary of urgency and unexpected requests.",
-            "reporting_instructions": "If you receive a suspicious email, report it to security@talbros.test using the Report Phish button.",
-            "created_at": now_iso()})
+      #  await db.landing_pages.insert_one({
+          #  "id": new_id(), "name": "Talbros Security Awareness Check",
+         #   "title": "TALBROS SECURITY AWARENESS CHECK",
+          #  "message": "This was a simulated phishing awareness exercise conducted by the Talbros Security team. No harm was done.",
+         #   "indicators": "Check the sender address carefully. Hover links before clicking. Be wary of urgency and unexpected requests.",
+           # "reporting_instructions": "If you receive a suspicious email, report it to security@talbros.test using the Report Phish button.",
+           # "created_at": now_iso()})
     if await db.forms.count_documents({}) == 0:
         await db.forms.insert_one({
             "id": new_id(), "name": "Awareness Acknowledgement",
