@@ -988,7 +988,7 @@ def build_email_html(sim: dict, sr: dict) -> str:
     tracked_link = (
         f'<a href="{click_url}" '
         f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
-        f'VERIFY YOUR ACCOUNT NOW</a>'
+        f'Review Security Notice</a>'
     ) if sim["tracking"].get("click") else "VERIFY YOUR ACCOUNT NOW"
     has_inline_placeholder = link_placeholder in body
     if has_inline_placeholder:
@@ -2150,10 +2150,22 @@ async def report_recipient_xlsx(simulation_id: Optional[str] = None, user: dict 
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         # Make reply readable in Excel.
         ws.cell(ridx, columns.index("reply_text") + 1).alignment = Alignment(vertical="top", wrap_text=True)
+    # Set widths by data type, especially timestamps. Excel displays hashes (#######)
+    # when a formatted date/time value cannot fit inside its column.
     for i, col in enumerate(columns, 1):
-        ws.column_dimensions[ws.cell(1, i).column_letter].width = min(max(len(col) + 2, 14), 28)
-    if "reply_text" in columns:
-        ws.column_dimensions[ws.cell(1, columns.index("reply_text") + 1).column_letter].width = 45
+        letter = ws.cell(1, i).column_letter
+        if _is_report_timestamp_column(col):
+            ws.column_dimensions[letter].width = 28
+        elif col == "simulation_id":
+            ws.column_dimensions[letter].width = 22
+        elif col == "recipient_email":
+            ws.column_dimensions[letter].width = 32
+        elif col == "reply_text":
+            ws.column_dimensions[letter].width = 45
+        elif col == "attachment_names":
+            ws.column_dimensions[letter].width = 32
+        else:
+            ws.column_dimensions[letter].width = min(max(len(col) + 2, 14), 28)
     for i in range(max_files):
         ws.column_dimensions[ws.cell(1, len(columns) + i + 1).column_letter].width = 28
     ws.freeze_panes = "A2"
