@@ -1004,9 +1004,12 @@ def build_email_html(sim: dict, sr: dict) -> str:
     body = link_placeholder_pattern.sub(lambda _match: tracked_link, body)
     cta = ""
 
-    footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
-              f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
-              f'We never ask for your password or payment details by email.</p>')
+    # Compact footer retains a clear disclosure without repeated branding.
+    footer = (
+        '<p style="font-size:11px;color:#777;font-family:Arial,sans-serif;margin-top:18px">'
+        'Authorized internal security-awareness exercise. Never provide passwords or payment details by email.'
+        '</p>'
+    )
     return (f'<table role="presentation" width="100%"><tr><td style="padding:24px;'
             f'font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#111">'
             f'{body}{cta}{footer}{pixel}</td></tr></table>')
