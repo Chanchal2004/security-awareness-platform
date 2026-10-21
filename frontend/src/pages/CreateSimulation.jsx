@@ -31,7 +31,7 @@ export default function CreateSimulation() {
   const [emails, setEmails] = useState("");
   const [senderId, setSenderId] = useState("");
   const [subject, setSubject] = useState("");
-  const [body, setBody] = useState("<p>Compose your awareness email…</p>");
+  const [body, setBody] = useState("");
   const [destUrl, setDestUrl] = useState("https://security-awareness-platform-vtor.vercel.app/awareness");
   const [tracking, setTracking] = useState({ open: true, click: true, landing: true, form: true, form_submit: true });
   const [simEnabled, setSimEnabled] = useState(false);
@@ -235,7 +235,7 @@ export default function CreateSimulation() {
                 <div className="flex gap-2"><span className="text-muted-foreground w-14 text-xs">Subject</span><span className="font-semibold">{subject || "(no subject)"}</span></div>
               </div>
               <div className="pt-3 prose-sm [&_a]:text-primary [&_a]:underline" dangerouslySetInnerHTML={{ __html: body }} />
-              {tracking.click && <div className="mt-3"><span className="inline-block bg-primary text-primary-foreground text-xs px-3 py-2 rounded-md">Activate Your Account Now</span></div>}
+              {tracking.click && <div className="mt-3"><span className="inline-block bg-primary text-primary-foreground text-xs px-3 py-2 rounded-md">Open Secure Document</span></div>}
             </div>
           </div>
 
