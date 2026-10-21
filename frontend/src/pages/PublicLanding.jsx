@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
-import { Shield, AlertTriangle, CheckCircle2, Flag } from "lucide-react";
+import { Shield, CheckCircle2, Flag } from "lucide-react";
 import { api, apiError } from "../lib/api";
 import { Loading } from "../components/common";
 
@@ -79,26 +79,9 @@ export default function PublicLanding() {
       <div className="w-full max-w-2xl overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-xl shadow-slate-200/60">
         <div className="h-1.5 w-full bg-indigo-600" />
         <div className="p-6 sm:p-10">
-          <div className="mb-7 flex items-center gap-4">
-            <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-amber-200 bg-amber-50">
-              <AlertTriangle className="h-6 w-6 text-amber-600" />
-            </div>
-            <div>
-              <h1 className="text-lg font-bold tracking-tight text-slate-900 sm:text-xl">
-                {lp?.title || "TALBROS SECURITY AWARENESS CHECK"}
-              </h1>
-              <p className="mt-1 text-sm text-slate-500">Talbros Security Awareness Center</p>
-            </div>
-          </div>
-
-          <div className="mb-7 rounded-xl border border-amber-200 bg-amber-50 p-4">
-            <div className="flex items-start gap-3">
-              <Shield className="mt-0.5 h-5 w-5 shrink-0 text-amber-600" />
-              <p className="text-sm leading-6 text-amber-950">
-                {lp?.message || "This was a simulated phishing awareness exercise. No harm was done."}
-              </p>
-            </div>
-          </div>
+          <p className="mb-6 text-xs text-slate-500">
+            Authorized internal security-awareness exercise.
+          </p>
 
           {lp?.indicators && (
             <div className="mb-6 rounded-xl border border-slate-200 bg-slate-50 p-4">
