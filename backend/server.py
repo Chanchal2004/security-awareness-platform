@@ -981,24 +981,34 @@ def build_email_html(sim: dict, sr: dict) -> str:
     base = PUBLIC_BASE_URL
     click_url = f"{base}/api/track/click/{sr['token']}"
     pixel = f'<img src="{base}/api/track/open/{sr["token"]}.png" width="1" height="1" alt="" style="display:none" />' if sim["tracking"].get("open") else ""
-    body = sim["body_html"]
-    # Insert a clearly labeled awareness link exactly where the editor places
-    # {{REVIEW_SECURITY_LINK}}. Its unique token URL preserves click tracking.
-    link_placeholder = "{{ACTIVATE YOUR ACCOUNT NOW}}"
-    tracked_link = (
-        f'<a href="{click_url}" '
-        f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
-        f'ACTIVATE YOUR ACCOUNT NOW</a>'
-    ) if sim["tracking"].get("click") else "ACTIVATE YOUR ACCOUNT NOW"
-    has_inline_placeholder = link_placeholder in body
-    if has_inline_placeholder:
-        body = body.replace(link_placeholder, tracked_link)
+    body = sim["body_html"] or ""
+
+    # Place the tracked awareness link exactly where the editor includes a marker
+    # or an unlinked CTA phrase. Use a transparent awareness label rather than a
+    # misleading account-verification prompt.
+    link_placeholder_pattern = re.compile(
+        r"\{\{\s*(?:REVIEW_SECURITY_LINK|VERIFY YOUR ACCOUNT NOW|ACTIVATE YOUR ACCOUNT NOW)\s*\}\}"
+        r"|Verify Your Account Now|Activate Your Account Now",
+        re.IGNORECASE,
+    )
+    has_inline_link = bool(link_placeholder_pattern.search(body))
+    if sim["tracking"].get("click"):
+        tracked_link = (
+            f'<a href="{click_url}" '
+            f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
+            f'Review Security Notice</a>'
+        )
+    else:
+        tracked_link = "Review Security Notice"
+
+    if has_inline_link:
+        body = link_placeholder_pattern.sub(lambda _match: tracked_link, body)
         cta = ""
     else:
-        # Backward-compatible fallback for templates that do not yet contain
-        # the placeholder: keep showing the link after the body.
+        # Backward-compatible fallback for existing templates without an inline marker.
         cta = (f'<p style="margin:16px 0;font-family:Arial,sans-serif;font-size:14px">'
                f'{tracked_link}</p>') if sim["tracking"].get("click") else ""
+
     footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
               f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
               f'We never ask for your password or payment details by email.</p>')
@@ -2150,22 +2160,10 @@ async def report_recipient_xlsx(simulation_id: Optional[str] = None, user: dict 
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         # Make reply readable in Excel.
         ws.cell(ridx, columns.index("reply_text") + 1).alignment = Alignment(vertical="top", wrap_text=True)
-    # Set widths by data type, especially timestamps. Excel displays hashes (#######)
-    # when a formatted date/time value cannot fit inside its column.
     for i, col in enumerate(columns, 1):
-        letter = ws.cell(1, i).column_letter
-        if _is_report_timestamp_column(col):
-            ws.column_dimensions[letter].width = 28
-        elif col == "simulation_id":
-            ws.column_dimensions[letter].width = 22
-        elif col == "recipient_email":
-            ws.column_dimensions[letter].width = 32
-        elif col == "reply_text":
-            ws.column_dimensions[letter].width = 45
-        elif col == "attachment_names":
-            ws.column_dimensions[letter].width = 32
-        else:
-            ws.column_dimensions[letter].width = min(max(len(col) + 2, 14), 28)
+        ws.column_dimensions[ws.cell(1, i).column_letter].width = min(max(len(col) + 2, 14), 28)
+    if "reply_text" in columns:
+        ws.column_dimensions[ws.cell(1, columns.index("reply_text") + 1).column_letter].width = 45
     for i in range(max_files):
         ws.column_dimensions[ws.cell(1, len(columns) + i + 1).column_letter].width = 28
     ws.freeze_panes = "A2"
