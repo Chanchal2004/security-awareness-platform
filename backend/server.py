@@ -988,7 +988,7 @@ def build_email_html(sim: dict, sr: dict) -> str:
     tracked_link = (
         f'<a href="{click_url}" '
         f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
-        f'Review Security Notice</a>'
+        f'VERIFY YOUR ACCOUNT NOW</a>'
     ) if sim["tracking"].get("click") else "VERIFY YOUR ACCOUNT NOW"
     has_inline_placeholder = link_placeholder in body
     if has_inline_placeholder:
