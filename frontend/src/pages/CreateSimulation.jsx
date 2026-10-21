@@ -106,6 +106,12 @@ export default function CreateSimulation() {
   const senderObj = senders.find((s) => s.id === senderId);
   const fromDisplay = simEnabled && simName ? simName : (senderObj?.name || "TALBROS Security Awareness Center");
   const fromEmail = simEnabled && simFrom ? simFrom : (senderObj?.email || "security-awareness@talbros.test");
+  // Mirror the backend's inline placeholder rendering in the preview.
+  // Link text stays clearly labeled for an authorized awareness exercise.
+  const previewBody = body.replace(
+    /\{\{\s*(?:REVIEW_SECURITY_LINK|VERIFY YOUR ACCOUNT NOW|ACTIVATE YOUR ACCOUNT NOW)\s*\}\}|Verify Your Account Now|Activate Your Account Now/gi,
+    '<a href="#" style="color:#0563c1;text-decoration:underline;font-weight:600">Review Security Notice</a>'
+  );
 
   const inputCls = "w-full h-10 px-3 rounded-md bg-background border border-border text-sm outline-none focus:border-primary/60";
   const labelCls = "text-xs font-semibold uppercase tracking-wider text-muted-foreground";
@@ -234,8 +240,7 @@ export default function CreateSimulation() {
                 <div className="flex gap-2"><span className="text-muted-foreground w-14 text-xs">To</span><span className="font-mono-t text-xs">{emails.split(/[\n,;]+/).map((e) => e.trim()).filter(Boolean)[0] || "recipient@example.test"}</span></div>
                 <div className="flex gap-2"><span className="text-muted-foreground w-14 text-xs">Subject</span><span className="font-semibold">{subject || "(no subject)"}</span></div>
               </div>
-              <div className="pt-3 prose-sm [&_a]:text-primary [&_a]:underline" dangerouslySetInnerHTML={{ __html: body }} />
-              {tracking.click && <div className="mt-3"><span className="inline-block bg-primary text-primary-foreground text-xs px-3 py-2 rounded-md">Open Secure Document</span></div>}
+              <div className="pt-3 prose-sm [&_a]:text-primary [&_a]:underline" dangerouslySetInnerHTML={{ __html: previewBody }} />
             </div>
           </div>
 
