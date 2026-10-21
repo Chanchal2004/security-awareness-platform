@@ -983,33 +983,28 @@ def build_email_html(sim: dict, sr: dict) -> str:
     pixel = f'<img src="{base}/api/track/open/{sr["token"]}.png" width="1" height="1" alt="" style="display:none" />' if sim["tracking"].get("open") else ""
     body = sim["body_html"] or ""
 
-    # Place the tracked awareness link exactly where the editor includes a marker
-    # or an unlinked CTA phrase. Use a transparent awareness label rather than a
-    # misleading account-verification prompt.
+    # Replace known CTA markers and common typos in-place with the tracked link.
     link_placeholder_pattern = re.compile(
-        r"\{\{\s*(?:REVIEW_SECURITY_LINK|VERIFY YOUR ACCOUNT NOW|ACTIVATE YOUR ACCOUNT NOW)\s*\}\}"
-        r"|Verify Your Account Now|Activate Your Account Now",
+        r"\{\{\s*(?:REVIEW_SECURITY_LINK|VERIFY YOUR ACCOUNT NOW|ACTIVATE YOUR ACCOUNT NOW|ACTIVTE YOUR ACCOUNT NOW|ACTIVE YOUR ACCOUNT NOW)\s*\}\}"
+        r"|Verify Your Account Now|Activate Your Account Now|Activte Your Account Now|Active Your Account Now",
         re.IGNORECASE,
     )
     if sim["tracking"].get("click"):
         tracked_link = (
             f'<a href="{click_url}" '
             f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
-            f'Review Security Notice</a>'
+            f'Activate Your Account Now</a>'
         )
     else:
-        tracked_link = "Review Security Notice"
+        tracked_link = "Activate Your Account Now"
 
     # Replace the marker/text in-place only. Never append a second CTA at the end.
     body = link_placeholder_pattern.sub(lambda _match: tracked_link, body)
     cta = ""
 
-    # Compact footer retains a clear disclosure without repeated branding.
-    footer = (
-        '<p style="font-size:11px;color:#777;font-family:Arial,sans-serif;margin-top:18px">'
-        'Authorized internal security-awareness exercise. Never provide passwords or payment details by email.'
-        '</p>'
-    )
+    # Keep the email body uncluttered. The landing page retains the internal
+    # security-awareness disclosure for this authorized simulation.
+    footer = ""
     return (f'<table role="presentation" width="100%"><tr><td style="padding:24px;'
             f'font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#111">'
             f'{body}{cta}{footer}{pixel}</td></tr></table>')
