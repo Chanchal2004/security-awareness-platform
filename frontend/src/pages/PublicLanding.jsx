@@ -50,10 +50,7 @@ export default function PublicLanding() {
     setError("");
 
     try {
-      await api.post(`/public/form-submit/${token}`, {
-        responses,
-      });
-
+      await api.post(`/public/form-submit/${token}`, { responses });
       setSubmitted(true);
     } catch (err) {
       setError(apiError(err));
@@ -65,11 +62,9 @@ export default function PublicLanding() {
       <main className="flex min-h-screen items-center justify-center bg-slate-50 p-6">
         <section className="w-full max-w-md rounded-2xl border border-slate-200 bg-white p-8 text-center shadow-sm">
           <Shield className="mx-auto mb-4 h-10 w-10 text-slate-400" />
-
           <h2 className="text-xl font-bold text-slate-900">
             Page unavailable
           </h2>
-
           <p className="mt-2 text-sm leading-6 text-slate-600">
             This link may be invalid or expired.
           </p>
@@ -92,12 +87,10 @@ export default function PublicLanding() {
         <section className="w-full max-w-xl rounded-2xl border border-emerald-200 bg-white p-8 shadow-sm">
           <div className="flex items-start gap-4">
             <CheckCircle2 className="mt-1 h-6 w-6 shrink-0 text-emerald-600" />
-
             <div>
               <h2 className="text-xl font-bold text-slate-900">
                 Thank you!
               </h2>
-
               <p className="mt-2 text-sm leading-6 text-slate-600">
                 Your acknowledgement was recorded.
               </p>
@@ -116,7 +109,6 @@ export default function PublicLanding() {
         <div className="h-1.5 w-full bg-indigo-600" />
 
         <div className="p-6 sm:p-10">
-          {/* Page heading */}
           <header className="mb-8">
             <h1 className="text-2xl font-bold tracking-tight text-slate-900 sm:text-3xl">
               Employee Details
@@ -126,57 +118,42 @@ export default function PublicLanding() {
               Fill in the details below.
             </p>
 
-            <p className="mt-4 border-b border-slate-200 pb-4 text-xs leading-5 text-slate-500">
+            <p className="mt-3 text-xs leading-5 text-slate-500">
               Authorized internal security-awareness exercise.
             </p>
           </header>
 
-          {/* Security awareness information */}
           {lp?.indicators && (
             <section className="mb-6 rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-900">
                 <Shield className="h-4 w-4 text-indigo-600" />
                 How to spot a suspicious email
               </div>
-
               <p className="text-sm leading-6 text-slate-600">
                 {lp.indicators}
               </p>
             </section>
           )}
 
-          {/* Reporting information */}
           {lp?.reporting_instructions && (
             <section className="mb-6 rounded-xl border border-slate-200 bg-slate-50 p-4">
               <div className="mb-2 flex items-center gap-2 text-sm font-semibold text-slate-900">
                 <Flag className="h-4 w-4 text-indigo-600" />
                 Reporting
               </div>
-
               <p className="text-sm leading-6 text-slate-600">
                 {lp.reporting_instructions}
               </p>
             </section>
           )}
 
-          {/* Form */}
           {data.form_enabled && (
             <form
               onSubmit={submit}
               onFocus={onFocus}
-              className="space-y-5 border-t border-slate-200 pt-7"
+              className="space-y-5 pt-2"
               data-testid="awareness-form"
             >
-              <div className="mb-2">
-                <h2 className="text-xl font-bold tracking-tight text-slate-900">
-                  Employee Details
-                </h2>
-
-                <p className="mt-2 text-sm leading-6 text-slate-600">
-                  Fill in the details below.
-                </p>
-              </div>
-
               {data.form.fields.map((f) => (
                 <div key={f.id}>
                   <label
