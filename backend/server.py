@@ -2306,13 +2306,10 @@ async def startup():
                                      "provider": "Resend", "status": "ACTIVE",
                                      "created_at": now_iso()})
     if await db.landing_pages.count_documents({}) == 0:
-      #  await db.landing_pages.insert_one({
-          #  "id": new_id(), "name": "Talbros Security Awareness Check",
-         #   "title": "TALBROS SECURITY AWARENESS CHECK",
-          #  "message": "This was a simulated phishing awareness exercise conducted by the Talbros Security team. No harm was done.",
-         #   "indicators": "Check the sender address carefully. Hover links before clicking. Be wary of urgency and unexpected requests.",
-           # "reporting_instructions": "If you receive a suspicious email, report it to security@talbros.test using the Report Phish button.",
-           # "created_at": now_iso()})
+        # Default landing-page seed is intentionally disabled.
+        # Create a landing page from the dashboard when required.
+        pass
+
     if await db.forms.count_documents({}) == 0:
         await db.forms.insert_one({
             "id": new_id(), "name": "Awareness Acknowledgement",
