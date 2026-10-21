@@ -118,9 +118,7 @@ export default function PublicLanding() {
               Fill in the details below.
             </p>
 
-            <p className="mt-3 text-xs leading-5 text-slate-500">
-              Authorized internal security-awareness exercise.
-            </p>
+           
           </header>
 
           {lp?.indicators && (
