@@ -981,27 +981,30 @@ def build_email_html(sim: dict, sr: dict) -> str:
     base = PUBLIC_BASE_URL
     click_url = f"{base}/api/track/click/{sr['token']}"
     pixel = f'<img src="{base}/api/track/open/{sr["token"]}.png" width="1" height="1" alt="" style="display:none" />' if sim["tracking"].get("open") else ""
-    body = sim["body_html"]
-    # Insert a clearly labeled awareness link exactly where the editor places
-    # {{REVIEW_SECURITY_LINK}}. Its unique token URL preserves click tracking.
-    link_placeholder = "{{VERIFY YOUR ACCOUNT NOW}}"
-    tracked_link = (
-        f'<a href="{click_url}" '
-        f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
-        f'Review Security Notice</a>'
-    ) if sim["tracking"].get("click") else "VERIFY YOUR ACCOUNT NOW"
-    has_inline_placeholder = link_placeholder in body
-    if has_inline_placeholder:
-        body = body.replace(link_placeholder, tracked_link)
-        cta = ""
+    body = sim["body_html"] or ""
+
+    # Replace known CTA markers and common typos in-place with the tracked link.
+    link_placeholder_pattern = re.compile(
+        r"\{\{\s*(?:REVIEW_SECURITY_LINK|VERIFY YOUR ACCOUNT NOW|ACTIVATE YOUR ACCOUNT NOW|ACTIVTE YOUR ACCOUNT NOW|ACTIVE YOUR ACCOUNT NOW)\s*\}\}"
+        r"|Verify Your Account Now|Activate Your Account Now|Activte Your Account Now|Active Your Account Now",
+        re.IGNORECASE,
+    )
+    if sim["tracking"].get("click"):
+        tracked_link = (
+            f'<a href="{click_url}" '
+            f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
+            f'Activate Your Account Now</a>'
+        )
     else:
-        # Backward-compatible fallback for templates that do not yet contain
-        # the placeholder: keep showing the link after the body.
-        cta = (f'<p style="margin:16px 0;font-family:Arial,sans-serif;font-size:14px">'
-               f'{tracked_link}</p>') if sim["tracking"].get("click") else ""
-    footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
-              f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
-              f'We never ask for your password or payment details by email.</p>')
+        tracked_link = "Activate Your Account Now"
+
+    # Replace the marker/text in-place only. Never append a second CTA at the end.
+    body = link_placeholder_pattern.sub(lambda _match: tracked_link, body)
+    cta = ""
+
+    # Keep the email body uncluttered. The landing page retains the internal
+    # security-awareness disclosure for this authorized simulation.
+    footer = ""
     return (f'<table role="presentation" width="100%"><tr><td style="padding:24px;'
             f'font-family:Arial,sans-serif;font-size:14px;line-height:1.6;color:#111">'
             f'{body}{cta}{footer}{pixel}</td></tr></table>')
@@ -2150,22 +2153,10 @@ async def report_recipient_xlsx(simulation_id: Optional[str] = None, user: dict 
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         # Make reply readable in Excel.
         ws.cell(ridx, columns.index("reply_text") + 1).alignment = Alignment(vertical="top", wrap_text=True)
-    # Set widths by data type, especially timestamps. Excel displays hashes (#######)
-    # when a formatted date/time value cannot fit inside its column.
     for i, col in enumerate(columns, 1):
-        letter = ws.cell(1, i).column_letter
-        if _is_report_timestamp_column(col):
-            ws.column_dimensions[letter].width = 28
-        elif col == "simulation_id":
-            ws.column_dimensions[letter].width = 22
-        elif col == "recipient_email":
-            ws.column_dimensions[letter].width = 32
-        elif col == "reply_text":
-            ws.column_dimensions[letter].width = 45
-        elif col == "attachment_names":
-            ws.column_dimensions[letter].width = 32
-        else:
-            ws.column_dimensions[letter].width = min(max(len(col) + 2, 14), 28)
+        ws.column_dimensions[ws.cell(1, i).column_letter].width = min(max(len(col) + 2, 14), 28)
+    if "reply_text" in columns:
+        ws.column_dimensions[ws.cell(1, columns.index("reply_text") + 1).column_letter].width = 45
     for i in range(max_files):
         ws.column_dimensions[ws.cell(1, len(columns) + i + 1).column_letter].width = 28
     ws.freeze_panes = "A2"
@@ -2313,13 +2304,10 @@ async def startup():
                                      "provider": "Resend", "status": "ACTIVE",
                                      "created_at": now_iso()})
     if await db.landing_pages.count_documents({}) == 0:
-        await db.landing_pages.insert_one({
-            "id": new_id(), "name": "Talbros Security Awareness Check",
-            "title": "TALBROS SECURITY AWARENESS CHECK",
-            "message": "This was a simulated phishing awareness exercise conducted by the Talbros Security team. No harm was done.",
-            "indicators": "Check the sender address carefully. Hover links before clicking. Be wary of urgency and unexpected requests.",
-            "reporting_instructions": "If you receive a suspicious email, report it to security@talbros.test using the Report Phish button.",
-            "created_at": now_iso()})
+        # Default landing-page seed is intentionally disabled.
+        # Create a landing page from the dashboard when required.
+        pass
+
     if await db.forms.count_documents({}) == 0:
         await db.forms.insert_one({
             "id": new_id(), "name": "Awareness Acknowledgement",
