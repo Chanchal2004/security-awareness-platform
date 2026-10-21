@@ -984,12 +984,12 @@ def build_email_html(sim: dict, sr: dict) -> str:
     body = sim["body_html"]
     # Insert a clearly labeled awareness link exactly where the editor places
     # {{REVIEW_SECURITY_LINK}}. Its unique token URL preserves click tracking.
-    link_placeholder = "{{VERIFY YOUR ACCOUNT NOW}}"
+    link_placeholder = "{{ACTIVATE YOUR ACCOUNT NOW}}"
     tracked_link = (
         f'<a href="{click_url}" '
         f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
-        f'Review Security Notice</a>'
-    ) if sim["tracking"].get("click") else "VERIFY YOUR ACCOUNT NOW"
+        f'ACTIVATE YOUR ACCOUNT NOW</a>'
+    ) if sim["tracking"].get("click") else "ACTIVATE YOUR ACCOUNT NOW"
     has_inline_placeholder = link_placeholder in body
     if has_inline_placeholder:
         body = body.replace(link_placeholder, tracked_link)
