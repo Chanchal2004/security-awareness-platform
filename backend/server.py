@@ -982,11 +982,23 @@ def build_email_html(sim: dict, sr: dict) -> str:
     click_url = f"{base}/api/track/click/{sr['token']}"
     pixel = f'<img src="{base}/api/track/open/{sr["token"]}.png" width="1" height="1" alt="" style="display:none" />' if sim["tracking"].get("open") else ""
     body = sim["body_html"]
-    # A clearly labeled link for authorized security-awareness exercises.
-    # The unique tracking URL is preserved so clicks continue to be recorded.
-    cta = (f'<p style="margin:16px 0;font-family:Arial,sans-serif;font-size:14px">'
-           f'<a href="{click_url}" style="color:#0563c1;text-decoration:underline">'
-           f'Review Security Notice</a></p>') if sim["tracking"].get("click") else ""
+    # Insert a clearly labeled awareness link exactly where the editor places
+    # {{REVIEW_SECURITY_LINK}}. Its unique token URL preserves click tracking.
+    link_placeholder = "{{VERIFY YOUR ACCOUNT NOW}}"
+    tracked_link = (
+        f'<a href="{click_url}" '
+        f'style="color:#0563c1;text-decoration:underline;font-weight:600">'
+        f'Review Security Notice</a>'
+    ) if sim["tracking"].get("click") else "VERIFY YOUR ACCOUNT NOW"
+    has_inline_placeholder = link_placeholder in body
+    if has_inline_placeholder:
+        body = body.replace(link_placeholder, tracked_link)
+        cta = ""
+    else:
+        # Backward-compatible fallback for templates that do not yet contain
+        # the placeholder: keep showing the link after the body.
+        cta = (f'<p style="margin:16px 0;font-family:Arial,sans-serif;font-size:14px">'
+               f'{tracked_link}</p>') if sim["tracking"].get("click") else ""
     footer = (f'<p style="font-size:12px;color:#888;font-family:Arial,sans-serif;margin-top:28px">'
               f'Sent by {EMAIL_FROM_NAME}. This is an authorized internal security awareness exercise. '
               f'We never ask for your password or payment details by email.</p>')
